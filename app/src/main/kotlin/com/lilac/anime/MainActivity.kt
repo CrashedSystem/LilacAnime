@@ -4,7 +4,6 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.net.ConnectivityManager
@@ -23,9 +22,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.webkit.WebChromeClient
-import android.webkit.ConsoleMessage
-import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -113,7 +109,6 @@ import io.github.peerless2012.ass.media.parser.AssSubtitleParserFactory
 import io.github.peerless2012.ass.media.type.AssRenderType
 import io.github.peerless2012.ass.media.widget.AssSubtitleView
 import com.lilac.anime.data.*
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -126,19 +121,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
-import java.util.zip.ZipInputStream
-import java.net.URLConnection
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
 import android.content.Intent
@@ -831,7 +819,6 @@ object AniSkipService {
                         val combinedText = names.joinToString(" ")
 
                         val detectedSeason = extractSeasonNumber(combinedText)
-                        val anilistSeason = item.optString("season").trim()
                         val seasonYear = item.optInt("seasonYear", 0).takeIf { it > 0 }
                         val episodes = item.optInt("episodes", 0).takeIf { it > 0 }
 
@@ -3844,7 +3831,6 @@ fun PlayerScreen(
     
     var currentEpisode by remember(episode) { mutableStateOf(episode) }
     
-    var isFullScreen by remember { mutableStateOf(false) }
     var streamUrl by remember { mutableStateOf<String?>(null) }
     var subtitlesUrl by remember { mutableStateOf<String?>(null) }
     var subtitleSource by remember { mutableStateOf("none") }
@@ -3859,7 +3845,6 @@ fun PlayerScreen(
     var buttonAniSkipSegment by remember { mutableStateOf<AniSkipSegment?>(null) }
     var aniSkipEnteredAtMs by remember { mutableLongStateOf(-1L) }
     var skippedAniSkipKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var skipEpisodeKey by remember { mutableStateOf<String?>(null) }
     var suppressProgressSaveForEpisode by remember { mutableStateOf<Int?>(null) }
 
     var subtitleSizePercent by rememberSaveable { mutableFloatStateOf(vm.playerSettings.subtitleSize) }
@@ -3985,27 +3970,23 @@ fun PlayerScreen(
         offlineEp = OfflineStore.getEpisode(context, anime.id, currentEpisode.number)
     }
 
-    LaunchedEffect(isFullScreen) {
-        activity?.window?.let { window ->
-            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-            if (isFullScreen) {
-                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                insetsController.hide(WindowInsetsCompat.Type.systemBars())
-                insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            } else {
-                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                insetsController.show(WindowInsetsCompat.Type.systemBars())
-            }
+    // 플레이어에서는 상태 표시줄/내비게이션 바를 항상 숨긴다.
+    // 플레이어를 벗어나면 원래 상태로 복원한다.
+    DisposableEffect(activity) {
+        val window = activity?.window
+        val controller = window?.let {
+            WindowCompat.getInsetsController(it, it.decorView)
+        }
+        controller?.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller?.hide(WindowInsetsCompat.Type.systemBars())
+
+        onDispose {
+            controller?.show(WindowInsetsCompat.Type.systemBars())
         }
     }
 
-    BackHandler {
-        if (isFullScreen) {
-            isFullScreen = false
-        } else {
-            back()
-        }
-    }
+    BackHandler { back() }
 
     // Restore a user-imported subtitle saved in OfflineStore even when the
     // current episode itself is not downloaded. This makes the custom subtitle
@@ -4039,7 +4020,6 @@ fun PlayerScreen(
         buttonAniSkipSegment = null
         aniSkipEnteredAtMs = -1L
         skippedAniSkipKeys = emptySet()
-        skipEpisodeKey = null
         suppressProgressSaveForEpisode = null
         
         val targetUrl = if (isDownloaded) {
@@ -4347,12 +4327,6 @@ fun PlayerScreen(
             val localDataSourceFactory = DefaultDataSource.Factory(context)
             DefaultMediaSourceFactory(context).setDataSourceFactory(localDataSourceFactory)
         } else {
-            val parsedUri = Uri.parse(url)
-            val refererHost = if (!parsedUri.host.isNullOrEmpty()) {
-                "${parsedUri.scheme ?: "https"}://${parsedUri.host}/"
-            } else {
-                "https://linkkf.tv/"
-            }
             val upstreamFactory = if (isOffline) {
                 null
             } else {
@@ -4455,7 +4429,7 @@ fun PlayerScreen(
     }
 
     LaunchedEffect(streamUrl, currentEpisode.number) {
-        val currentStreamUrl = streamUrl ?: return@LaunchedEffect
+        if (streamUrl == null) return@LaunchedEffect
 
         aniSkipSegments = emptyList()
         activeAniSkipSegment = null
@@ -4538,8 +4512,6 @@ fun PlayerScreen(
                         endTime = safeEnd
                     )
                 }
-
-                skipEpisodeKey = "${anime.id}_${currentEpisode.number}"
 
                 Log.d(
                     "AniSkip",
@@ -4748,9 +4720,7 @@ fun PlayerScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(
-                    onClick = {
-                        if (isFullScreen) isFullScreen = false else back()
-                    }
+                    onClick = back
                 ) {
                     Icon(
                         imageVector = Icons.Default.ArrowBack,
@@ -5086,6 +5056,8 @@ object KairanSubtitleService {
     private const val BLOG_URL = "https://kairan03.blogspot.com"
     private const val CACHE_DIR = "kairan_subtitles"
     private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+    private const val MAX_SEARCH_CACHE = 64
+    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, List<KairanSearchResult>>()
 
     suspend fun findSubtitle(context: Context, title: String, episodeNumber: Int): KairanSubtitleResult? =
         withContext(Dispatchers.IO) {
@@ -5197,6 +5169,9 @@ object KairanSubtitleService {
 
 
     private fun searchKairanBlog(query: String): List<KairanSearchResult> {
+        val cacheKey = kairanSearchTitle(query)
+        searchCache[cacheKey]?.let { return it }
+
         return try {
             val encoded = URLEncoder.encode(query, "UTF-8")
             val url = "$BLOG_URL/search?q=$encoded"
@@ -5230,7 +5205,12 @@ object KairanSubtitleService {
 
                 if (code !in 200..299 || html.isBlank()) return emptyList()
 
-                parseKairanSearchResults(html)
+                val parsed = parseKairanSearchResults(html)
+                if (searchCache.size >= MAX_SEARCH_CACHE) {
+                    searchCache.keys.firstOrNull()?.let(searchCache::remove)
+                }
+                searchCache[cacheKey] = parsed
+                parsed
             } finally {
                 connection.disconnect()
             }
@@ -5414,16 +5394,6 @@ object KairanSubtitleService {
                     if (looksLikeHtml(temp)) { Log.w("Kairan", "DOWNLOAD_RETURNED_HTML"); temp.delete(); continue }
                     if (!isAssFile(temp)) { Log.w("Kairan", "DOWNLOAD_NOT_ASS"); temp.delete(); continue }
 
-                    val assInfo = inspectAssFile(temp)
-                    Log.d(
-                        "Kairan",
-                        "ASS_INFO dialogue=${assInfo.dialogueCount} " +
-                            "positioned=${assInfo.positionedCount} " +
-                            "moving=${assInfo.movingCount} " +
-                            "playRes=${assInfo.playResX}x${assInfo.playResY} " +
-                            "styles=${assInfo.styleCount}"
-                    )
-
                     val target = File(dir, "${safe}_${episode}.ass")
                     temp.copyTo(target, overwrite = true); temp.delete()
                     return target.absolutePath
@@ -5433,57 +5403,6 @@ object KairanSubtitleService {
             }
         }
         return null
-    }
-
-    private data class AssInfo(
-        val dialogueCount: Int,
-        val positionedCount: Int,
-        val movingCount: Int,
-        val playResX: Int?,
-        val playResY: Int?,
-        val styleCount: Int
-    )
-
-    private fun inspectAssFile(file: File): AssInfo = try {
-        val text = file.inputStream().bufferedReader().use { it.readText() }
-        val lower = text.lowercase(Locale.ROOT)
-
-        val dialogueLines = text.lineSequence()
-            .filter { it.trimStart().startsWith("dialogue:", ignoreCase = true) }
-            .toList()
-
-        val positioned = dialogueLines.count {
-            Regex("""\\pos\s*\(""", RegexOption.IGNORE_CASE).containsMatchIn(it)
-        }
-
-        val moving = dialogueLines.count {
-            Regex("""\\move\s*\(""", RegexOption.IGNORE_CASE).containsMatchIn(it)
-        }
-
-        val playResX = Regex(
-            """(?im)^\s*playresx\s*[:=]\s*(\d+)"""
-        ).find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
-
-        val playResY = Regex(
-            """(?im)^\s*playresy\s*[:=]\s*(\d+)"""
-        ).find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
-
-        val styleCount = text.lineSequence().count {
-            val t = it.trimStart()
-            t.startsWith("style:", ignoreCase = true) ||
-                t.startsWith("format:", ignoreCase = true) && lower.contains("[v4+ styles]")
-        }
-
-        AssInfo(
-            dialogueCount = dialogueLines.size,
-            positionedCount = positioned,
-            movingCount = moving,
-            playResX = playResX,
-            playResY = playResY,
-            styleCount = styleCount
-        )
-    } catch (_: Exception) {
-        AssInfo(0, 0, 0, null, null, 0)
     }
 
     private fun isAssFile(file: File): Boolean = try {
