@@ -65,4 +65,11 @@ implementation("io.coil-kt.coil3:coil-network-okhttp:3.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+    
+    // Retrofit2
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    // (선택) 만약 JSON 파싱을 위해 Gson 변환기를 사용하신다면 아래 줄도 추가해 주세요.
+    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    
+    implementation("io.github.peerless2012:ass-media:0.5.1")
 }

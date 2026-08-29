@@ -16,12 +16,16 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.TypedValue
 import android.view.View
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebChromeClient
+import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -90,6 +94,7 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.FileDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadRequest
 import androidx.media3.exoplayer.offline.DownloadService
@@ -101,7 +106,14 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import coil3.compose.AsyncImage
+import io.github.peerless2012.ass.media.AssHandler
+import io.github.peerless2012.ass.media.AssHandlerConfig
+import io.github.peerless2012.ass.media.factory.AssRenderersFactory
+import io.github.peerless2012.ass.media.parser.AssSubtitleParserFactory
+import io.github.peerless2012.ass.media.type.AssRenderType
+import io.github.peerless2012.ass.media.widget.AssSubtitleView
 import com.lilac.anime.data.*
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -114,9 +126,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
+import java.util.zip.ZipInputStream
+import java.net.URLConnection
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.sync.Semaphore
@@ -124,6 +140,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.coroutineScope
 import android.content.Intent
 import kotlinx.coroutines.flow.update
 
@@ -134,13 +151,6 @@ import kotlinx.coroutines.flow.update
 data class StreamQuality(
     val label: String,
     val url: String
-)
-
-data class ExoVideoQualityOption(
-    val label: String,
-    val width: Int,
-    val height: Int,
-    val isAuto: Boolean = false
 )
 
 data class PlayerSettings(
@@ -154,25 +164,1732 @@ data class PlayerSettings(
     val customFontPath: String? = null
 )
 
-object SubtitleColorPresets {
-    val TextColors = mapOf(
-        "흰색" to android.graphics.Color.WHITE,
-        "노란색" to android.graphics.Color.YELLOW,
-        "연두색" to android.graphics.Color.GREEN,
-        "하늘색" to android.graphics.Color.CYAN
+data class ExoVideoQualityOption(
+    val label: String,
+    val width: Int,
+    val height: Int,
+    val isAuto: Boolean = false
+)
+
+data class AniSkipSegment(
+    val type: String,
+    val startTime: Double,
+    val endTime: Double,
+    val episodeLength: Double
+)
+
+object AniSkipService {
+    private const val BASE_URL = "https://api.aniskip.com/v2"
+    private const val JIKAN_URL = "https://api.jikan.moe/v4"
+    private const val ANILIST_URL = "https://graphql.anilist.co"
+    private const val KITSU_URL = "https://kitsu.io/api/edge"
+
+    private data class MalCandidate(
+        val malId: Int,
+        val score: Int,
+        val matchedTitle: String,
+        val seasonNumber: Int? = null,
+        val year: Int? = null,
+        val romajiTitle: String? = null
     )
 
-    val StrokeColors = mapOf(
-        "검은색" to android.graphics.Color.BLACK,
-        "투명(없음)" to android.graphics.Color.TRANSPARENT,
-        "붉은색" to android.graphics.Color.RED
-    )
+    suspend fun getSkipTimes(
+        title: String,
+        episodeNumber: Int,
+        episodeLengthSeconds: Int
+    ): List<AniSkipSegment> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(
+                "AniSkip",
+                "START title=\"$title\" episode=$episodeNumber length=$episodeLengthSeconds"
+            )
 
-    val BackgroundColors = mapOf(
-        "투명" to android.graphics.Color.TRANSPARENT,
-        "반투명 검정" to android.graphics.Color.parseColor("#80000000"),
-        "검정" to android.graphics.Color.BLACK
-    )
+            val malId = findMalId(title)
+            Log.d("AniSkip", "MAL_ID=$malId title=\"$title\"")
+
+            if (malId == null) {
+                Log.e("AniSkip", "MAL ID를 찾지 못했습니다.")
+                return@withContext emptyList()
+            }
+
+            val actualLength = episodeLengthSeconds.coerceAtLeast(0)
+
+            // 길이 필터 없는 결과와 실제 영상 길이로 조회한 결과를 모두 가져온다.
+            // 길이가 크게 다른 rough 결과를 먼저 선택하면 스킵 위치가 틀어질 수 있다.
+            Log.d(
+                "AniSkip",
+                "FETCH rough malId=$malId episode=$episodeNumber episodeLength=0"
+            )
+            val rough = requestSkipTimes(
+                malId = malId,
+                episodeNumber = episodeNumber,
+                episodeLength = 0
+            )
+
+            Log.d("AniSkip", "ROUGH_RESULT count=${rough.size} values=$rough")
+
+            val exact = if (actualLength > 0) {
+                Log.d(
+                    "AniSkip",
+                    "FETCH exact malId=$malId episode=$episodeNumber episodeLength=$actualLength"
+                )
+                requestSkipTimes(
+                    malId = malId,
+                    episodeNumber = episodeNumber,
+                    episodeLength = actualLength
+                )
+            } else {
+                emptyList()
+            }
+
+            Log.d("AniSkip", "EXACT_RESULT count=${exact.size} values=$exact")
+
+            val all = (rough + exact)
+                .distinctBy {
+                    "${it.type}:${it.startTime}:${it.endTime}:${it.episodeLength}"
+                }
+
+            if (all.isEmpty()) {
+                Log.w(
+                    "AniSkip",
+                    "NO_SKIP_DATA malId=$malId episode=$episodeNumber actualLength=$actualLength"
+                )
+                return@withContext emptyList()
+            }
+
+            val selected = all
+                .groupBy { it.type }
+                .mapNotNull { (type, values) ->
+                    val chosen = values.minByOrNull { segment ->
+                        if (
+                            actualLength > 0 &&
+                            segment.episodeLength > 0.0
+                        ) {
+                            kotlin.math.abs(
+                                segment.episodeLength - actualLength.toDouble()
+                            )
+                        } else {
+                            Double.MAX_VALUE
+                        }
+                    }
+
+                    chosen?.also {
+                        Log.d(
+                            "AniSkip",
+                            "SELECT type=$type start=${it.startTime} end=${it.endTime} " +
+                                "sourceLength=${it.episodeLength} " +
+                                "localLength=$actualLength " +
+                                "lengthDiff=${
+                                    if (actualLength > 0 && it.episodeLength > 0.0)
+                                        it.episodeLength - actualLength
+                                    else
+                                        0.0
+                                }"
+                        )
+                    }
+                }
+                .sortedBy { it.startTime }
+
+            selected.forEach {
+                Log.d(
+                    "AniSkip",
+                    "SEGMENT type=${it.type} start=${it.startTime} " +
+                        "end=${it.endTime} sourceLength=${it.episodeLength}"
+                )
+            }
+
+            selected
+        } catch (e: Exception) {
+            Log.e("AniSkip", "getSkipTimes exception", e)
+            emptyList()
+        }
+    }
+
+    private fun requestSkipTimes(
+        malId: Int,
+        episodeNumber: Int,
+        episodeLength: Int
+    ): List<AniSkipSegment> {
+        val url = URL(
+            "$BASE_URL/skip-times/$malId/$episodeNumber" +
+                "?types=op" +
+                "&types=ed" +
+                "&types=mixed-op" +
+                "&types=mixed-ed" +
+                "&episodeLength=$episodeLength"
+        )
+
+        Log.d("AniSkip", "REQUEST $url")
+
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15000
+            readTimeout = 15000
+            useCaches = false
+            instanceFollowRedirects = true
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Accept-Encoding", "identity")
+            setRequestProperty("Connection", "close")
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Android) LilacAnime/1.0")
+        }
+
+        return try {
+            val responseCode = connection.responseCode
+            Log.d("AniSkip", "HTTP $responseCode url=$url")
+
+            val stream = if (responseCode in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            }
+
+            val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            Log.d("AniSkip", "BODY ${body.take(8000)}")
+
+            if (responseCode !in 200..299) {
+                Log.e("AniSkip", "HTTP_ERROR code=$responseCode body=${body.take(2000)}")
+                return emptyList()
+            }
+
+            val root = JSONObject(body)
+            val found = root.optBoolean("found", false)
+            Log.d("AniSkip", "FOUND=$found status=${root.optInt("statusCode", responseCode)}")
+
+            val results = root.optJSONArray("results") ?: return emptyList()
+
+            buildList {
+                for (i in 0 until results.length()) {
+                    val item = results.optJSONObject(i) ?: continue
+                    val type = item.optString("skipType").ifBlank {
+                        item.optString("skip_type")
+                    }
+
+                    if (type !in setOf("op", "ed", "mixed-op", "mixed-ed")) continue
+
+                    val interval = item.optJSONObject("interval") ?: continue
+                    val start = interval.optDouble("startTime", interval.optDouble("start_time", Double.NaN))
+                    val end = interval.optDouble("endTime", interval.optDouble("end_time", Double.NaN))
+                    val sourceLength = item.optDouble(
+                        "episodeLength",
+                        item.optDouble("episode_length", 0.0)
+                    )
+
+                    if (start.isFinite() && end.isFinite() && end > start) {
+                        add(
+                            AniSkipSegment(
+                                type = type,
+                                startTime = start,
+                                endTime = end,
+                                episodeLength = sourceLength
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("AniSkip", "REQUEST_EXCEPTION url=$url", e)
+            emptyList()
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun translateText(
+        text: String,
+        source: String,
+        target: String,
+        provider: String
+    ): String? {
+        if (text.isBlank()) return null
+
+        return try {
+            val url = when (provider) {
+                "mymemory" -> URL(
+                    "https://api.mymemory.translated.net/get" +
+                        "?q=${Uri.encode(text)}" +
+                        "&langpair=${Uri.encode(source)}%7C${Uri.encode(target)}"
+                )
+                else -> URL(
+                    "https://translate.googleapis.com/translate_a/single" +
+                        "?client=gtx" +
+                        "&sl=$source" +
+                        "&tl=$target" +
+                        "&dt=t" +
+                        "&q=${Uri.encode(text)}"
+                )
+            }
+
+            Log.d(
+                "AniSkip",
+                "TRANSLATE REQUEST provider=$provider source=$source target=$target text=\"$text\""
+            )
+
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 8000
+                readTimeout = 8000
+                useCaches = false
+                instanceFollowRedirects = true
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Android) LilacAnime/1.0"
+                )
+            }
+
+            try {
+                val code = connection.responseCode
+                val body = (
+                    if (code in 200..299) connection.inputStream
+                    else connection.errorStream
+                )?.bufferedReader()?.use { it.readText() }.orEmpty()
+
+                Log.d(
+                    "AniSkip",
+                    "TRANSLATE HTTP=$code provider=$provider source=$source target=$target body=${body.take(2500)}"
+                )
+
+                if (code !in 200..299 || body.isBlank()) {
+                    return null
+                }
+
+                val result = if (provider == "mymemory") {
+                    JSONObject(body)
+                        .optJSONObject("responseData")
+                        ?.optString("translatedText")
+                        .orEmpty()
+                } else {
+                    val root = JSONArray(body)
+                    val first = root.optJSONArray(0)
+                    if (first == null) {
+                        ""
+                    } else {
+                        buildString {
+                            for (i in 0 until first.length()) {
+                                val row = first.optJSONArray(i) ?: continue
+                                append(row.optString(0))
+                            }
+                        }
+                    }
+                }
+                    .replace("&quot;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&amp;", "&")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace(Regex("<[^>]+>"), " ")
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+
+                Log.d(
+                    "AniSkip",
+                    "TRANSLATE RESULT provider=$provider source=$source target=$target result=\"$result\""
+                )
+
+                result.takeIf { it.isNotBlank() }
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.e(
+                "AniSkip",
+                "TRANSLATE exception provider=$provider source=$source target=$target text=\"$text\"",
+                e
+            )
+            null
+        }
+    }
+
+    private fun translateKoreanToJapanese(text: String): String? {
+        translateText(text, "ko", "ja", "mymemory")?.let { return it }
+        translateText(text, "ko", "ja", "google")?.let { return it }
+        return null
+    }
+
+    private fun translateKoreanToEnglish(text: String): String? {
+        translateText(text, "ko", "en", "mymemory")?.let { return it }
+        translateText(text, "ko", "en", "google")?.let { return it }
+        return null
+    }
+
+    private fun findMalId(title: String): Int? {
+        val requestedSeason = extractRequestedSeason(title)
+        val titleCandidates = buildTitleCandidates(title)
+        val original = titleCandidates.firstOrNull().orEmpty()
+        val seasonless = titleCandidates.getOrNull(1).orEmpty()
+        val baseTitle = seasonless.ifBlank { original }
+
+        Log.d(
+            "AniSkip",
+            "TITLE_RESOLVE original=\"$title\" cleaned=\"$original\" " +
+                "seasonless=\"$seasonless\" season=$requestedSeason"
+        )
+
+        val knownAliases = linkedMapOf(
+            "도망을잘치는도련님" to listOf(
+                "逃げ上手の若君",
+                "Nige Jouzu no Wakagimi",
+                "The Elusive Samurai"
+            ),
+            "전생했더니슬라임이었던건에대하여" to listOf(
+                "転生したらスライムだった件",
+                "Tensei Shitara Slime Datta Ken",
+                "That Time I Got Reincarnated as a Slime"
+            )
+        )
+
+        val normalizedOriginal = normalizeTitle(title)
+        val knownAlias = knownAliases.entries
+            .firstOrNull { normalizedOriginal.contains(it.key) }
+            ?.value
+            .orEmpty()
+
+        if (knownAlias.isNotEmpty()) {
+            Log.d("AniSkip", "TITLE_RESOLVE knownAliases=$knownAlias")
+
+            for (alias in knownAlias) {
+                Log.d("AniSkip", "KNOWN_ALIAS search=\"$alias\"")
+                val matches = findMalCandidatesWithAniList(alias, requestedSeason)
+                chooseBestMalCandidate(matches, requestedSeason)?.let { selected ->
+                    Log.d(
+                        "AniSkip",
+                        "KNOWN_ALIAS SELECT malId=${selected.malId} " +
+                            "romaji=\"${selected.romajiTitle}\" title=\"${selected.matchedTitle}\" " +
+                            "score=${selected.score} season=${selected.seasonNumber}"
+                    )
+                    return selected.malId
+                }
+            }
+        }
+
+        val queryCandidates = linkedSetOf<String>()
+
+        if (baseTitle.isNotBlank() && baseTitle.any { it in 'A'..'Z' || it in 'a'..'z' }) {
+            queryCandidates += baseTitle
+        }
+
+        val japaneseTitle = translateKoreanToJapanese(baseTitle)
+        Log.d("AniSkip", "TITLE_RESOLVE japanese=\"$japaneseTitle\"")
+
+        if (!japaneseTitle.isNullOrBlank()) {
+            queryCandidates += japaneseTitle
+        }
+
+        val englishTitle = translateKoreanToEnglish(baseTitle)
+        Log.d("AniSkip", "TITLE_RESOLVE english=\"$englishTitle\"")
+
+        if (!englishTitle.isNullOrBlank()) {
+            queryCandidates += englishTitle
+        }
+
+        for (query in queryCandidates) {
+            Log.d("AniSkip", "AniList SEARCH query=\"$query\" season=$requestedSeason")
+
+            val matches = findMalCandidatesWithAniList(
+                query,
+                requestedSeason
+            )
+
+            chooseBestMalCandidate(matches, requestedSeason)?.let { selected ->
+                Log.d(
+                    "AniSkip",
+                    "AniList SELECT malId=${selected.malId} " +
+                        "romaji=\"${selected.romajiTitle}\" " +
+                        "title=\"${selected.matchedTitle}\" " +
+                        "score=${selected.score} season=${selected.seasonNumber} year=${selected.year}"
+                )
+                return selected.malId
+            }
+        }
+
+        val fallbackQueries = linkedSetOf<String>()
+        fallbackQueries.addAll(queryCandidates)
+
+        if (baseTitle.isNotBlank()) {
+            fallbackQueries += baseTitle
+        }
+
+        for (query in fallbackQueries) {
+            Log.d("AniSkip", "Jikan FALLBACK search=\"$query\"")
+            val jikanMatches = findMalCandidatesWithJikan(
+                query,
+                requestedSeason
+            )
+
+            chooseBestMalCandidate(jikanMatches, requestedSeason)?.let { selected ->
+                Log.d(
+                    "AniSkip",
+                    "Jikan SELECT malId=${selected.malId} " +
+                        "title=\"${selected.matchedTitle}\" score=${selected.score} season=${selected.seasonNumber}"
+                )
+                return selected.malId
+            }
+        }
+
+        for (query in fallbackQueries) {
+            Log.d("AniSkip", "Kitsu FALLBACK search=\"$query\"")
+            val kitsuMatches = findMalCandidatesWithKitsu(
+                query,
+                requestedSeason
+            )
+
+            chooseBestMalCandidate(kitsuMatches, requestedSeason)?.let { selected ->
+                Log.d(
+                    "AniSkip",
+                    "Kitsu SELECT malId=${selected.malId} " +
+                        "title=\"${selected.matchedTitle}\" score=${selected.score} season=${selected.seasonNumber}"
+                )
+                return selected.malId
+            }
+        }
+
+        for (query in fallbackQueries) {
+            Log.d("AniSkip", "MAL FALLBACK search=\"$query\"")
+            val malMatches = findMalCandidatesWithMalSearch(
+                query,
+                requestedSeason
+            )
+
+            chooseBestMalCandidate(malMatches, requestedSeason)?.let { selected ->
+                Log.d(
+                    "AniSkip",
+                    "MAL SELECT malId=${selected.malId} " +
+                        "title=\"${selected.matchedTitle}\" score=${selected.score} season=${selected.seasonNumber}"
+                )
+                return selected.malId
+            }
+        }
+
+        Log.e(
+            "AniSkip",
+            "MAL ID not found title=\"$title\" japanese=\"$japaneseTitle\" english=\"$englishTitle\""
+        )
+        return null
+    }
+
+    private fun findMalCandidatesWithAniList(
+        title: String,
+        requestedSeason: Int?
+    ): List<MalCandidate> {
+        val query = """
+            query (${'$'}search: String) {
+                Page(page: 1, perPage: 25) {
+                    media(
+                        search: ${'$'}search
+                        type: ANIME
+                    ) {
+                        id
+                        idMal
+                        season
+                        seasonYear
+                        format
+                        episodes
+                        title {
+                            romaji
+                            english
+                            native
+                        }
+                        synonyms
+                    }
+                }
+            }
+        """.trimIndent()
+
+        return try {
+            val body = JSONObject()
+                .put("query", query)
+                .put(
+                    "variables",
+                    JSONObject().put("search", title)
+                )
+                .toString()
+
+            val connection =
+                (URL(ANILIST_URL).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    useCaches = false
+                    setRequestProperty(
+                        "Content-Type",
+                        "application/json"
+                    )
+                    setRequestProperty(
+                        "Accept",
+                        "application/json"
+                    )
+                    setRequestProperty(
+                        "User-Agent",
+                        "LilacAnime/1.0"
+                    )
+                }
+
+            try {
+                connection.outputStream.use { output ->
+                    output.write(
+                        body.toByteArray(Charsets.UTF_8)
+                    )
+                    output.flush()
+                }
+
+                val responseCode = connection.responseCode
+                val responseStream =
+                    if (responseCode in 200..299) {
+                        connection.inputStream
+                    } else {
+                        connection.errorStream
+                    }
+
+                val response =
+                    responseStream
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+                        ?: ""
+
+                Log.d(
+                    "AniSkip",
+                    "AniList HTTP=$responseCode candidate=\"$title\" response=${response.take(2500)}"
+                )
+
+                if (
+                    responseCode !in 200..299 ||
+                    response.isBlank()
+                ) {
+                    return emptyList()
+                }
+
+                val root = JSONObject(response)
+
+                val media =
+                    root.optJSONObject("data")
+                        ?.optJSONObject("Page")
+                        ?.optJSONArray("media")
+                        ?: return emptyList()
+
+                val normalizedQuery =
+                    normalizeTitle(title)
+
+                buildList {
+                    for (i in 0 until media.length()) {
+                        val item =
+                            media.optJSONObject(i)
+                                ?: continue
+
+                        val malId =
+                            item.optInt("idMal", 0)
+
+                        if (malId <= 0) continue
+
+                        val names =
+                            mutableListOf<String>()
+
+                        val romajiTitle =
+                            item.optJSONObject("title")
+                                ?.optString("romaji")
+                                ?.trim()
+                                ?.takeIf { it.isNotBlank() }
+
+                        item.optJSONObject("title")
+                            ?.let { titleObj ->
+                                romajiTitle?.let(names::add)
+
+                                titleObj.optString("english")
+                                    .takeIf { it.isNotBlank() }
+                                    ?.let(names::add)
+
+                                titleObj.optString("native")
+                                    .takeIf { it.isNotBlank() }
+                                    ?.let(names::add)
+                            }
+
+                        item.optJSONArray("synonyms")
+                            ?.let { synonyms ->
+                                for (j in 0 until synonyms.length()) {
+                                    synonyms.optString(j)
+                                        .takeIf { it.isNotBlank() }
+                                        ?.let(names::add)
+                                }
+                            }
+
+                        val romajiScore = romajiTitle?.let {
+                            compareTitles(
+                                normalizedQuery,
+                                normalizeTitle(it)
+                            )
+                        } ?: 0
+
+                        val titleScore = names.maxOfOrNull {
+                            compareTitles(
+                                normalizedQuery,
+                                normalizeTitle(it)
+                            )
+                        } ?: 0
+
+                        val strongestTitleScore = maxOf(titleScore, romajiScore)
+
+                        val combinedText = names.joinToString(" ")
+
+                        val detectedSeason = extractSeasonNumber(combinedText)
+                        val anilistSeason = item.optString("season").trim()
+                        val seasonYear = item.optInt("seasonYear", 0).takeIf { it > 0 }
+                        val episodes = item.optInt("episodes", 0).takeIf { it > 0 }
+
+                        var score = strongestTitleScore
+
+                        if (requestedSeason != null) {
+                            if (detectedSeason == requestedSeason) {
+                                score += 5000
+                            } else if (
+                                detectedSeason != null &&
+                                detectedSeason != requestedSeason
+                            ) {
+                                score -= 5000
+                            }
+                        }
+
+                        // 제목에 시즌 번호가 없더라도 sequel/season 제목은 romaji/english/native에
+                        // 숫자 표현이 포함되는 경우가 많으므로 추가 가산점을 준다.
+                        if (requestedSeason != null) {
+                            val seasonTokens = listOf(
+                                "${requestedSeason}th season",
+                                "${requestedSeason}st season",
+                                "${requestedSeason}nd season",
+                                "${requestedSeason}rd season",
+                                "season $requestedSeason",
+                                "part $requestedSeason",
+                                "${requestedSeason}rd season",
+                                "${requestedSeason}th season"
+                            )
+
+                            val hasRequestedSeasonToken = names.any { name ->
+                                val n = normalizeTitle(name)
+                                seasonTokens.any { token -> n.contains(token) } ||
+                                    n.contains("${requestedSeason}기") ||
+                                    n.contains("제 ${requestedSeason} 기") ||
+                                    n.contains("${requestedSeason}th") ||
+                                    n.contains("${requestedSeason}nd") ||
+                                    n.contains("${requestedSeason}rd") ||
+                                    n.contains("${requestedSeason}st")
+                            }
+
+                            if (hasRequestedSeasonToken) score += 3000
+                        }
+
+                        val format =
+                            item.optString("format")
+
+                        if (
+                            requestedSeason != null &&
+                            format == "TV"
+                        ) {
+                            score += 100
+                        }
+
+                        val year = seasonYear
+
+                        val matchedTitle =
+                            names.maxByOrNull {
+                                compareTitles(
+                                    normalizedQuery,
+                                    normalizeTitle(it)
+                                )
+                            }.orEmpty()
+
+                        Log.d(
+                            "AniSkip",
+                            "AniList candidate malId=$malId score=$score title=\"$matchedTitle\" " +
+                                "romaji=\"$romajiTitle\" season=$detectedSeason year=$year names=$names"
+                        )
+
+                        add(
+                            MalCandidate(
+                                malId = malId,
+                                score = score,
+                                matchedTitle = matchedTitle,
+                                seasonNumber = detectedSeason,
+                                year = year,
+                                romajiTitle = romajiTitle
+                            )
+                        )
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.e(
+                "AniSkip",
+                "AniList exception candidate=\"$title\"",
+                e
+            )
+            emptyList()
+        }
+    }
+
+    private fun findMalCandidatesWithMalSearch(
+        title: String,
+        requestedSeason: Int?
+    ): List<MalCandidate> {
+        return try {
+            val query = Uri.encode(title)
+            val url = URL(
+                "https://myanimelist.net/search/prefix.json" +
+                    "?type=anime&keyword=$query"
+            )
+
+            Log.d("AniSkip", "MAL REQUEST $url")
+
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10000
+                readTimeout = 10000
+                useCaches = false
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Android) LilacAnime/1.0"
+                )
+            }
+
+            try {
+                val code = connection.responseCode
+                val body = (
+                    if (code in 200..299) connection.inputStream
+                    else connection.errorStream
+                )?.bufferedReader()?.use { it.readText() }.orEmpty()
+
+                Log.d(
+                    "AniSkip",
+                    "MAL HTTP=$code candidate=\"$title\" response=${body.take(2500)}"
+                )
+
+                if (code !in 200..299 || body.isBlank()) {
+                    return emptyList()
+                }
+
+                val root = JSONObject(body)
+                val categories = root.optJSONArray("categories") ?: return emptyList()
+
+                val items = buildList {
+                    for (i in 0 until categories.length()) {
+                        val category = categories.optJSONObject(i) ?: continue
+                        val categoryItems = category.optJSONArray("items") ?: continue
+
+                        for (j in 0 until categoryItems.length()) {
+                            categoryItems.optJSONObject(j)?.let { add(it) }
+                        }
+                    }
+                }
+
+                val normalizedQuery = normalizeTitle(title)
+
+                buildList {
+                    for (item in items) {
+                        val malId = item.optInt("id", 0)
+                        if (malId <= 0) continue
+
+                        val name = item.optString("name").trim()
+                        if (name.isBlank()) continue
+
+                        val normalizedName = normalizeTitle(name)
+                        val titleScore = compareTitles(normalizedQuery, normalizedName)
+                        var score = titleScore
+
+                        val detectedSeason = extractSeasonNumber(name)
+
+                        if (requestedSeason != null && titleScore > 0) {
+                            if (detectedSeason == requestedSeason) {
+                                score += 5000
+                            } else if (
+                                detectedSeason != null &&
+                                detectedSeason != requestedSeason
+                            ) {
+                                score -= 5000
+                            }
+                        }
+
+                        Log.d(
+                            "AniSkip",
+                            "MAL candidate malId=$malId score=$score " +
+                                "title=\"$name\" season=$detectedSeason"
+                        )
+
+                        add(
+                            MalCandidate(
+                                malId = malId,
+                                score = score,
+                                matchedTitle = name,
+                                seasonNumber = detectedSeason,
+                                year = null
+                            )
+                        )
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.e(
+                "AniSkip",
+                "MAL exception candidate=\"$title\"",
+                e
+            )
+            emptyList()
+        }
+    }
+
+    private fun findMalCandidatesWithJikan(
+        title: String,
+        requestedSeason: Int?
+    ): List<MalCandidate> {
+        return try {
+            val query = Uri.encode(title)
+            val url = URL(
+                "$JIKAN_URL/anime?q=$query&limit=25"
+            )
+
+            Log.d(
+                "AniSkip",
+                "Jikan REQUEST $url"
+            )
+
+            val connection =
+                (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    useCaches = false
+                    setRequestProperty(
+                        "Accept",
+                        "application/json"
+                    )
+                    setRequestProperty(
+                        "User-Agent",
+                        "Mozilla/5.0 (Android) LilacAnime/1.0"
+                    )
+                }
+
+            try {
+                val responseCode =
+                    connection.responseCode
+
+                val responseStream =
+                    if (responseCode in 200..299) {
+                        connection.inputStream
+                    } else {
+                        connection.errorStream
+                    }
+
+                val body =
+                    responseStream
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+                        ?: ""
+
+                Log.d(
+                    "AniSkip",
+                    "Jikan HTTP=$responseCode candidate=\"$title\" response=${body.take(2000)}"
+                )
+
+                if (
+                    responseCode !in 200..299 ||
+                    body.isBlank()
+                ) {
+                    return emptyList()
+                }
+
+                val data =
+                    JSONObject(body)
+                        .optJSONArray("data")
+                        ?: return emptyList()
+
+                val normalizedQuery =
+                    normalizeTitle(title)
+
+                buildList {
+                    for (i in 0 until data.length()) {
+                        val item =
+                            data.optJSONObject(i)
+                                ?: continue
+
+                        val malId =
+                            item.optInt("mal_id", 0)
+
+                        if (malId <= 0) continue
+
+                        val names =
+                            mutableListOf<String>()
+
+                        item.optString("title")
+                            .takeIf { it.isNotBlank() }
+                            ?.let(names::add)
+
+                        item.optString("title_english")
+                            .takeIf { it.isNotBlank() }
+                            ?.let(names::add)
+
+                        item.optString("title_japanese")
+                            .takeIf { it.isNotBlank() }
+                            ?.let(names::add)
+
+                        item.optJSONArray("titles")
+                            ?.let { titles ->
+                                for (j in 0 until titles.length()) {
+                                    titles.optJSONObject(j)
+                                        ?.optString("title")
+                                        ?.takeIf {
+                                            it.isNotBlank()
+                                        }
+                                        ?.let(names::add)
+                                }
+                            }
+
+                        val titleScore =
+                            names.maxOfOrNull {
+                                compareTitles(
+                                    normalizedQuery,
+                                    normalizeTitle(it)
+                                )
+                            } ?: 0
+
+                        val combinedText =
+                            names.joinToString(" ")
+
+                        val detectedSeason =
+                            extractSeasonNumber(
+                                combinedText
+                            )
+
+                        var score = titleScore
+
+                        if (
+                            requestedSeason != null
+                        ) {
+                            if (
+                                detectedSeason ==
+                                requestedSeason
+                            ) {
+                                score += 5000
+                            } else if (
+                                detectedSeason != null &&
+                                detectedSeason != requestedSeason
+                            ) {
+                                score -= 2500
+                            }
+                        }
+
+                        val year =
+                            item.optString("year")
+                                .toIntOrNull()
+                                ?: item.optJSONObject("aired")
+                                    ?.optString("from")
+                                    ?.take(4)
+                                    ?.toIntOrNull()
+
+                        val matchedTitle =
+                            names.maxByOrNull {
+                                compareTitles(
+                                    normalizedQuery,
+                                    normalizeTitle(it)
+                                )
+                            }.orEmpty()
+
+                        Log.d(
+                            "AniSkip",
+                            "Jikan candidate malId=$malId score=$score title=\"$matchedTitle\" season=$detectedSeason year=$year"
+                        )
+
+                        add(
+                            MalCandidate(
+                                malId = malId,
+                                score = score,
+                                matchedTitle = matchedTitle,
+                                seasonNumber = detectedSeason,
+                                year = year
+                            )
+                        )
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.e(
+                "AniSkip",
+                "Jikan exception candidate=\"$title\"",
+                e
+            )
+            emptyList()
+        }
+    }
+
+    private fun findMalCandidatesWithKitsu(
+        title: String,
+        requestedSeason: Int?
+    ): List<MalCandidate> {
+        return try {
+            val query = Uri.encode(title)
+            val url = URL(
+                "$KITSU_URL/anime?filter[text]=$query&page[limit]=20&include=mappings"
+            )
+
+            Log.d(
+                "AniSkip",
+                "Kitsu REQUEST $url"
+            )
+
+            val connection =
+                (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    useCaches = false
+                    setRequestProperty(
+                        "Accept",
+                        "application/vnd.api+json"
+                    )
+                    setRequestProperty(
+                        "User-Agent",
+                        "Mozilla/5.0 (Android) LilacAnime/1.0"
+                    )
+                }
+
+            try {
+                val responseCode =
+                    connection.responseCode
+
+                val responseStream =
+                    if (responseCode in 200..299) {
+                        connection.inputStream
+                    } else {
+                        connection.errorStream
+                    }
+
+                val body =
+                    responseStream
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+                        ?: ""
+
+                Log.d(
+                    "AniSkip",
+                    "Kitsu HTTP=$responseCode candidate=\"$title\" response=${body.take(2500)}"
+                )
+
+                if (
+                    responseCode !in 200..299 ||
+                    body.isBlank()
+                ) {
+                    return emptyList()
+                }
+
+                val root = JSONObject(body)
+                val data =
+                    root.optJSONArray("data")
+                        ?: return emptyList()
+
+                val included =
+                    root.optJSONArray("included")
+
+                val normalizedQuery =
+                    normalizeTitle(title)
+
+                buildList {
+                    for (i in 0 until data.length()) {
+                        val item =
+                            data.optJSONObject(i)
+                                ?: continue
+
+                        val attributes =
+                            item.optJSONObject("attributes")
+                                ?: continue
+
+                        val names =
+                            mutableListOf<String>()
+
+                        attributes.optString("canonicalTitle")
+                            .takeIf { it.isNotBlank() }
+                            ?.let(names::add)
+
+                        attributes.optJSONObject("titles")
+                            ?.let { titles ->
+                                val keys =
+                                    titles.keys()
+
+                                while (keys.hasNext()) {
+                                    val key = keys.next()
+                                    titles.optString(key)
+                                        .takeIf {
+                                            it.isNotBlank()
+                                        }
+                                        ?.let(names::add)
+                                }
+                            }
+
+                        val titleScore =
+                            names.maxOfOrNull {
+                                compareTitles(
+                                    normalizedQuery,
+                                    normalizeTitle(it)
+                                )
+                            } ?: 0
+
+                        val combinedText =
+                            names.joinToString(" ")
+
+                        val detectedSeason =
+                            extractSeasonNumber(
+                                combinedText
+                            )
+
+                        var score = titleScore
+
+                        if (
+                            requestedSeason != null
+                        ) {
+                            if (
+                                detectedSeason ==
+                                requestedSeason
+                            ) {
+                                score += 5000
+                            } else if (
+                                detectedSeason != null &&
+                                detectedSeason != requestedSeason
+                            ) {
+                                score -= 2500
+                            }
+                        }
+
+                        val year =
+                            attributes.optString(
+                                "startDate"
+                            )
+                                .take(4)
+                                .toIntOrNull()
+
+                        var malId =
+                            findKitsuMalId(
+                                item,
+                                included
+                            )
+
+                        if (malId == null) {
+                            val slug =
+                                item.optString("id")
+
+                            if (
+                                slug.isNotBlank()
+                            ) {
+                                malId =
+                                    findMalIdFromKitsuSlug(
+                                        slug
+                                    )
+                            }
+                        }
+
+                        if (malId == null) {
+                            Log.d(
+                                "AniSkip",
+                                "Kitsu result has no MAL mapping title=$names"
+                            )
+                            continue
+                        }
+
+                        val matchedTitle =
+                            names.maxByOrNull {
+                                compareTitles(
+                                    normalizedQuery,
+                                    normalizeTitle(it)
+                                )
+                            }.orEmpty()
+
+                        Log.d(
+                            "AniSkip",
+                            "Kitsu candidate malId=$malId score=$score title=\"$matchedTitle\" season=$detectedSeason year=$year"
+                        )
+
+                        add(
+                            MalCandidate(
+                                malId = malId,
+                                score = score,
+                                matchedTitle = matchedTitle,
+                                seasonNumber = detectedSeason,
+                                year = year
+                            )
+                        )
+                    }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.e(
+                "AniSkip",
+                "Kitsu exception candidate=\"$title\"",
+                e
+            )
+            emptyList()
+        }
+    }
+
+    private fun findKitsuMalId(
+        item: JSONObject,
+        included: JSONArray?
+    ): Int? {
+        val relationships =
+            item.optJSONObject("relationships")
+                ?: return null
+
+        val mappings =
+            relationships.optJSONObject("mappings")
+                ?: return null
+
+        val data =
+            mappings.optJSONArray("data")
+                ?: return null
+
+        for (i in 0 until data.length()) {
+            val mapping =
+                data.optJSONObject(i)
+                    ?: continue
+
+            val mappingId =
+                mapping.optString("id")
+
+            if (
+                mappingId.isBlank()
+            ) {
+                continue
+            }
+
+            val includedMapping =
+                included?.let {
+                    findIncludedObject(
+                        it,
+                        "mappings",
+                        mappingId
+                    )
+                }
+
+            val attributes =
+                includedMapping
+                    ?.optJSONObject("attributes")
+                    ?: continue
+
+            val externalSite =
+                attributes.optString(
+                    "externalSite"
+                )
+
+            val externalId =
+                attributes.optString(
+                    "externalId"
+                )
+
+            if (
+                externalId.isNotBlank() &&
+                (
+                    externalSite.equals(
+                        "myanimelist",
+                        true
+                    ) ||
+                    externalSite.equals(
+                        "MyAnimeList",
+                        true
+                    ) ||
+                    externalSite.contains(
+                        "mal",
+                        true
+                    )
+                )
+            ) {
+                return externalId.toIntOrNull()
+            }
+        }
+
+        return null
+    }
+
+    private fun findIncludedObject(
+        included: JSONArray,
+        type: String,
+        id: String
+    ): JSONObject? {
+        for (i in 0 until included.length()) {
+            val item =
+                included.optJSONObject(i)
+                    ?: continue
+
+            if (
+                item.optString("type") == type &&
+                item.optString("id") == id
+            ) {
+                return item
+            }
+        }
+
+        return null
+    }
+
+    private fun findMalIdFromKitsuSlug(
+        kitsuId: String
+    ): Int? {
+        return try {
+            val url =
+                URL(
+                    "$KITSU_URL/anime/$kitsuId?include=mappings"
+                )
+
+            val connection =
+                (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                    useCaches = false
+                    setRequestProperty(
+                        "Accept",
+                        "application/vnd.api+json"
+                    )
+                }
+
+            try {
+                if (
+                    connection.responseCode !in 200..299
+                ) {
+                    return null
+                }
+
+                val body =
+                    connection.inputStream
+                        .bufferedReader()
+                        .use { it.readText() }
+
+                val root =
+                    JSONObject(body)
+
+                val included =
+                    root.optJSONArray("included")
+
+                val data =
+                    root.optJSONObject("data")
+                        ?: return null
+
+                return findKitsuMalId(
+                    data,
+                    included
+                )
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.e(
+                "AniSkip",
+                "Kitsu mapping exception id=$kitsuId",
+                e
+            )
+            null
+        }
+    }
+
+    private fun chooseBestMalCandidate(
+        candidates: List<MalCandidate>,
+        requestedSeason: Int?
+    ): MalCandidate? {
+        if (candidates.isEmpty()) return null
+
+        val grouped = candidates
+            .groupBy { it.malId }
+            .values
+            .mapNotNull { matches ->
+                matches.maxByOrNull { it.score }
+            }
+
+        val eligible = grouped.filter { candidate ->
+            val seasonOk = requestedSeason == null ||
+                candidate.seasonNumber == null ||
+                candidate.seasonNumber == requestedSeason
+
+            val threshold = if (requestedSeason != null) 4500 else 6500
+
+            seasonOk && candidate.score >= threshold
+        }
+
+        if (eligible.isEmpty()) {
+            Log.w(
+                "AniSkip",
+                "MAL_SELECT no strong candidate requestedSeason=$requestedSeason " +
+                    "candidates=${grouped.sortedByDescending { it.score }.take(5)}"
+            )
+            return null
+        }
+
+        return eligible.maxWithOrNull(
+            compareBy<MalCandidate> {
+                if (
+                    requestedSeason != null &&
+                    it.seasonNumber == requestedSeason
+                ) 1 else 0
+            }.thenBy { it.score }
+        )
+    }
+
+    private fun buildTitleCandidates(
+        title: String
+    ): List<String> {
+        val cleaned =
+            title
+                .replace(
+                    Regex("\\[[^]]*]"),
+                    " "
+                )
+                .replace(
+                    Regex("\\([^)]*\\)"),
+                    " "
+                )
+                .replace(
+                    Regex("\\s+"),
+                    " "
+                )
+                .trim()
+
+        val candidates =
+            linkedSetOf<String>()
+
+        fun addCandidate(value: String) {
+            val candidate =
+                value
+                    .replace(
+                        Regex("\\s+"),
+                        " "
+                    )
+                    .trim()
+
+            if (
+                candidate.isNotBlank()
+            ) {
+                candidates.add(candidate)
+            }
+        }
+
+        addCandidate(cleaned)
+
+        val seasonless =
+            cleaned
+                .replace(
+                    Regex(
+                        "(?i)(?:\\b(?:season|part|cour|"
+                            + "season\\s*[0-9]+|part\\s*[0-9]+)"
+                            + "\\b|\\b\\d+\\s*(?:st|nd|rd|th)"
+                            + "\\s+season\\b|\\b\\d+기\\b|"
+                            + "\\b시즌\\s*\\d+\\b|\\b제\\s*\\d+\\s*기\\b|"
+                            + "\\b第\\s*\\d+\\s*期\\b|\\b第\\s*\\d+\\s*季\\b)"
+                    ),
+                    " "
+                )
+                .replace(
+                    Regex("\\s+"),
+                    " "
+                )
+                .trim()
+
+        addCandidate(seasonless)
+
+        addCandidate(
+            cleaned.substringBefore(" - ")
+        )
+
+        addCandidate(
+            cleaned.substringBefore(" | ")
+        )
+
+        Regex(
+            "[A-Za-z][A-Za-z0-9À-ÿ'’:&.,!? -]{3,}"
+        )
+            .findAll(cleaned)
+            .map {
+                it.value.trim()
+            }
+            .filter {
+                it.length >= 4
+            }
+            .forEach {
+                addCandidate(it)
+            }
+
+        Regex(
+            "(?i)(?:anime|title)?\\s*[:：]\\s*"
+                + "([A-Za-z][A-Za-z0-9'’:&.,!? -]{3,})"
+        )
+            .find(cleaned)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.let(::addCandidate)
+
+        return candidates.toList()
+    }
+
+    private fun extractRequestedSeason(
+        title: String
+    ): Int? {
+        val patterns =
+            listOf(
+                Regex(
+                    "(?i)\\b(?:season|part|cour)\\s*(\\d+)\\b"
+                ),
+                Regex(
+                    "(?i)\\b(\\d+)(?:st|nd|rd|th)\\s+season\\b"
+                ),
+                Regex(
+                    "(?i)\\b(\\d+)\\s*기\\b"
+                ),
+                Regex(
+                    "(?i)\\b시즌\\s*(\\d+)\\b"
+                ),
+                Regex(
+                    "(?i)\\b제\\s*(\\d+)\\s*기\\b"
+                ),
+                Regex(
+                    "(?i)\\b第\\s*(\\d+)\\s*期\\b"
+                ),
+                Regex(
+                    "(?i)\\b第\\s*(\\d+)\\s*季\\b"
+                )
+            )
+
+        for (pattern in patterns) {
+            pattern.find(title)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+                ?.let { return it }
+        }
+
+        return null
+    }
+
+    private fun extractSeasonNumber(
+        value: String
+    ): Int? {
+        val patterns =
+            listOf(
+                Regex(
+                    "(?i)\\bseason\\s*(\\d+)\\b"
+                ),
+                Regex(
+                    "(?i)\\bpart\\s*(\\d+)\\b"
+                ),
+                Regex(
+                    "(?i)\\b(\\d+)(?:st|nd|rd|th)\\s+season\\b"
+                ),
+                Regex(
+                    "(?i)\\b(\\d+)\\s*기\\b"
+                ),
+                Regex(
+                    "(?i)\\b시즌\\s*(\\d+)\\b"
+                ),
+                Regex(
+                    "(?i)\\b제\\s*(\\d+)\\s*기\\b"
+                ),
+                Regex(
+                    "(?i)\\b第\\s*(\\d+)\\s*期\\b"
+                ),
+                Regex(
+                    "(?i)\\b第\\s*(\\d+)\\s*季\\b"
+                ),
+                Regex(
+                    "(?i)\\bS(\\d+)\\b"
+                )
+            )
+
+        for (pattern in patterns) {
+            pattern.find(value)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+                ?.let { return it }
+        }
+
+        return null
+    }
+
+    private fun normalizeTitle(
+        value: String
+    ): String =
+        value
+            .lowercase(Locale.ROOT)
+            .replace(
+                Regex("\\[[^]]*]"),
+                " "
+            )
+            .replace(
+                Regex("\\([^)]*\\)"),
+                " "
+            )
+            .replace(
+                Regex("[^\\p{L}\\p{N}]+"),
+                " "
+            )
+            .replace(
+                Regex("\\s+"),
+                " "
+            )
+            .trim()
+
+    private fun compareTitles(
+        a: String,
+        b: String
+    ): Int {
+        if (
+            a.isBlank() ||
+            b.isBlank()
+        ) {
+            return 0
+        }
+
+        if (a == b) {
+            return 10000
+        }
+
+        if (
+            a.contains(b) ||
+            b.contains(a)
+        ) {
+            return 8000
+        }
+
+        val left =
+            a.split(' ')
+                .filter {
+                    it.length >= 2
+                }
+                .toSet()
+
+        val right =
+            b.split(' ')
+                .filter {
+                    it.length >= 2
+                }
+                .toSet()
+
+        if (
+            left.isEmpty() ||
+            right.isEmpty()
+        ) {
+            return 0
+        }
+
+        val overlap =
+            left.intersect(right).size.toDouble() /
+                maxOf(
+                    left.size,
+                    right.size
+                ).toDouble()
+
+        return (
+            overlap * 6000.0
+        ).toInt()
+    }
 }
 
 // ============================================================
@@ -391,6 +2108,12 @@ class AnimeViewModel : ViewModel() {
                 withContext(Dispatchers.Main) {
                     loading = false
                 }
+            }
+
+            // Load the complete catalog in the background so SearchScreen does
+            // not depend on the user visiting the All Anime tab first.
+            if (!_isOffline.value) {
+                loadAllAnime()
             }
         }
     }
@@ -1668,14 +3391,34 @@ fun DetailScreen(
                 }
 
                 withContext(Dispatchers.IO) {
-                    val localVttPath = downloadSubtitleFile(context, anime.id, ep.number, vttUrl)
+                    // 오프라인 재생에서도 원본 ASS 스타일을 유지할 수 있도록
+                    // 다운로드 시 Kairan ASS를 먼저 찾아 앱 내부 영구 저장소에 보관한다.
+                    val kairanSubtitlePath = try {
+                        when (val result = KairanSubtitleService.findSubtitle(context, anime.title, ep.number)) {
+                            is KairanSubtitleResult.DirectFile -> result.path
+                            null -> null
+                        }
+                    } catch (e: Exception) {
+                        Log.w("Kairan", "OFFLINE_ASS_PRELOAD_FAILED episode=${ep.number}", e)
+                        null
+                    }
+
+                    val localVttPath = if (kairanSubtitlePath == null) {
+                        downloadSubtitleFile(context, anime.id, ep.number, vttUrl)
+                    } else {
+                        null
+                    }
+
                     startEpisodeDownload(context, anime.id, anime.title, ep, selectedQuality.url)
 
                     OfflineStore.saveAnime(context, anime)
                     OfflineStore.saveEpisode(
                         context = context,
                         animeId = anime.id,
-                        episode = ep.copy(videoUrl = selectedQuality.url, vttUrl = localVttPath ?: vttUrl)
+                        episode = ep.copy(
+                            videoUrl = selectedQuality.url,
+                            vttUrl = kairanSubtitlePath ?: localVttPath ?: vttUrl
+                        )
                     )
                 }
                 Toast.makeText(context, "${ep.number}화 (${selectedQuality.label}) 다운로드를 시작합니다.", Toast.LENGTH_SHORT).show()
@@ -1707,14 +3450,33 @@ fun DetailScreen(
                         }
 
                         withContext(Dispatchers.IO) {
-                            val localVttPath = downloadSubtitleFile(context, anime.id, ep.number, vttUrl)
+                            // 배치 다운로드도 동일하게 Kairan ASS를 우선 저장한다.
+                            val kairanSubtitlePath = try {
+                                when (val result = KairanSubtitleService.findSubtitle(context, anime.title, ep.number)) {
+                                    is KairanSubtitleResult.DirectFile -> result.path
+                                    null -> null
+                                }
+                            } catch (e: Exception) {
+                                Log.w("Kairan", "OFFLINE_ASS_PRELOAD_FAILED episode=${ep.number}", e)
+                                null
+                            }
+
+                            val localVttPath = if (kairanSubtitlePath == null) {
+                                downloadSubtitleFile(context, anime.id, ep.number, vttUrl)
+                            } else {
+                                null
+                            }
+
                             startEpisodeDownload(context, anime.id, anime.title, ep, selectedQuality.url)
 
                             OfflineStore.saveAnime(context, anime)
                             OfflineStore.saveEpisode(
                                 context = context,
                                 animeId = anime.id,
-                                episode = ep.copy(videoUrl = selectedQuality.url, vttUrl = localVttPath ?: vttUrl)
+                                episode = ep.copy(
+                                    videoUrl = selectedQuality.url,
+                                    vttUrl = kairanSubtitlePath ?: localVttPath ?: vttUrl
+                                )
                             )
                         }
                     }
@@ -2006,6 +3768,66 @@ fun DetailScreen(
 // PLAYER
 // ============================================================
 
+
+private const val USER_SUBTITLE_DIR = "user_subtitles"
+
+private fun isLocalUserSubtitlePath(path: String?): Boolean {
+    if (path.isNullOrBlank()) return false
+    val file = File(path)
+    if (!file.isFile) return false
+    val normalized = file.absolutePath.replace('\\', '/')
+    return normalized.contains("/${USER_SUBTITLE_DIR}/") &&
+        (normalized.endsWith(".ass", true) || normalized.endsWith(".ssa", true) ||
+         normalized.endsWith(".srt", true) || normalized.endsWith(".vtt", true))
+}
+
+private fun userSubtitleDirectory(context: Context): File =
+    File(context.filesDir, USER_SUBTITLE_DIR).apply { mkdirs() }
+
+private fun userSubtitleFile(context: Context, animeId: String, episodeNumber: Int, extension: String): File =
+    File(userSubtitleDirectory(context), "${animeId}_${episodeNumber}.${extension.lowercase(Locale.ROOT)}")
+
+private fun findLocalKairanAssSubtitle(
+    context: Context,
+    title: String,
+    episodeNumber: Int,
+    storedPath: String? = null
+): String? {
+    fun isAss(path: String): Boolean {
+        val lower = path.lowercase(Locale.ROOT)
+        return (lower.endsWith(".ass") || lower.endsWith(".ssa")) && File(path).isFile
+    }
+
+    if (!storedPath.isNullOrBlank() && isAss(storedPath)) {
+        return storedPath
+    }
+
+    val dir = File(context.filesDir, "kairan_subtitles")
+    if (!dir.isDirectory) return null
+
+    val safe = KairanSubtitleService.normalizeTitleForFile(title)
+        .replace(' ', '_')
+        .ifBlank { "subtitle" }
+        .take(60)
+
+    val exactNames = listOf(
+        "${safe}_${episodeNumber}.ass",
+        "${safe}_${episodeNumber}.ssa"
+    )
+    for (name in exactNames) {
+        val file = File(dir, name)
+        if (file.isFile) return file.absolutePath
+    }
+
+    return dir.listFiles()?.firstOrNull { file ->
+        if (!file.isFile) return@firstOrNull false
+        val n = file.name.lowercase(Locale.ROOT)
+        (n.endsWith(".ass") || n.endsWith(".ssa")) &&
+            n.contains("_${episodeNumber}") &&
+            n.startsWith(safe.lowercase(Locale.ROOT))
+    }?.absolutePath
+}
+
 @SuppressLint("SourceLockedOrientationActivity")
 @OptIn(UnstableApi::class)
 @Composable
@@ -2016,6 +3838,7 @@ fun PlayerScreen(
     back: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val activity = context as? Activity
     val isOffline by vm.isOffline.collectAsState()
     
@@ -2024,10 +3847,20 @@ fun PlayerScreen(
     var isFullScreen by remember { mutableStateOf(false) }
     var streamUrl by remember { mutableStateOf<String?>(null) }
     var subtitlesUrl by remember { mutableStateOf<String?>(null) }
+    var subtitleSource by remember { mutableStateOf("none") }
+    var kairanSubtitleResolved by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(true) }
     
     var isAutoPlayEnabled by rememberSaveable { mutableStateOf(true) }
+    var isAutoSkipEnabled by rememberSaveable { mutableStateOf(true) }
     var isControlsVisible by remember { mutableStateOf(true) }
+    var aniSkipSegments by remember { mutableStateOf<List<AniSkipSegment>>(emptyList()) }
+    var activeAniSkipSegment by remember { mutableStateOf<AniSkipSegment?>(null) }
+    var buttonAniSkipSegment by remember { mutableStateOf<AniSkipSegment?>(null) }
+    var aniSkipEnteredAtMs by remember { mutableLongStateOf(-1L) }
+    var skippedAniSkipKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var skipEpisodeKey by remember { mutableStateOf<String?>(null) }
+    var suppressProgressSaveForEpisode by remember { mutableStateOf<Int?>(null) }
 
     var subtitleSizePercent by rememberSaveable { mutableFloatStateOf(vm.playerSettings.subtitleSize) }
     var subtitleSizeText by rememberSaveable { mutableStateOf(vm.playerSettings.subtitleSize.toInt().toString()) }
@@ -2061,6 +3894,71 @@ fun PlayerScreen(
         }
     }
 
+    val subtitleFilePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri ?: return@rememberLauncherForActivityResult
+        scope.launch(Dispatchers.IO) {
+            try {
+                val displayName = runCatching {
+                    context.contentResolver.query(
+                        uri,
+                        arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                }.getOrNull() ?: "subtitle"
+
+                val lowerName = displayName.lowercase(Locale.ROOT)
+                val extension = when {
+                    lowerName.endsWith(".ass") -> "ass"
+                    lowerName.endsWith(".ssa") -> "ssa"
+                    lowerName.endsWith(".srt") -> "srt"
+                    lowerName.endsWith(".vtt") -> "vtt"
+                    else -> null
+                }
+
+                if (extension == null) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "ASS, SSA, SRT, VTT 자막만 사용할 수 있습니다.", Toast.LENGTH_SHORT).show()
+                    }
+                    return@launch
+                }
+
+                val target = userSubtitleFile(context, anime.id, currentEpisode.number, extension)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(target).use { output -> input.copyTo(output) }
+                } ?: throw IllegalStateException("자막 파일을 열 수 없습니다.")
+
+                val updatedEpisode = currentEpisode.copy(vttUrl = target.absolutePath)
+                OfflineStore.saveEpisode(
+                    context = context,
+                    animeId = anime.id,
+                    episode = updatedEpisode
+                )
+                withContext(Dispatchers.Main) {
+                    currentEpisode = updatedEpisode
+                    subtitlesUrl = target.absolutePath
+                    subtitleSource = "user"
+                    kairanSubtitleResolved = true
+                    Toast.makeText(
+                        context,
+                        "${currentEpisode.number}화 사용자 자막을 적용했습니다.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            } catch (e: Exception) {
+                Log.e("Subtitle", "USER_SUBTITLE_IMPORT_FAILED", e)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "자막 파일을 불러오지 못했습니다.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
     val episodeList = remember(anime.id) { 
         vm.episodes(anime).sortedBy { it.number } 
     }
@@ -2076,6 +3974,7 @@ fun PlayerScreen(
 
     val currentNextEpisode by rememberUpdatedState(nextEpisode)
     val currentAutoPlay by rememberUpdatedState(isAutoPlayEnabled)
+    val currentEpisodeState by rememberUpdatedState(currentEpisode)
 
     val isDownloaded = remember(anime.id, currentEpisode.number) {
         vm.isEpisodeDownloaded(anime.id, currentEpisode.number)
@@ -2108,15 +4007,40 @@ fun PlayerScreen(
         }
     }
 
+    // Restore a user-imported subtitle saved in OfflineStore even when the
+    // current episode itself is not downloaded. This makes the custom subtitle
+    // available again after leaving/reopening the player and also during offline playback.
+    LaunchedEffect(anime.id, currentEpisode.number) {
+        val stored = withContext(Dispatchers.IO) {
+            OfflineStore.getEpisode(context, anime.id, currentEpisode.number)
+        }
+        val storedSubtitle = stored?.vttUrl
+        if (isLocalUserSubtitlePath(storedSubtitle)) {
+            currentEpisode = currentEpisode.copy(vttUrl = storedSubtitle)
+            subtitlesUrl = storedSubtitle
+            subtitleSource = "user"
+            Log.d("Subtitle", "RESTORE_USER_SUBTITLE path=$storedSubtitle episode=${currentEpisode.number}")
+        }
+    }
+
     LaunchedEffect(currentEpisode, isDownloaded, offlineEp) {
         isLoading = true
         streamUrl = null
         subtitlesUrl = null
+        subtitleSource = "none"
+        kairanSubtitleResolved = false
         parsedStreamingQualities = emptyList()
         selectedStreamingQuality = null
         exoQualities = emptyList()
         selectedQualityOption = null
         pendingSeekPositionMs = -1L
+        aniSkipSegments = emptyList()
+        activeAniSkipSegment = null
+        buttonAniSkipSegment = null
+        aniSkipEnteredAtMs = -1L
+        skippedAniSkipKeys = emptySet()
+        skipEpisodeKey = null
+        suppressProgressSaveForEpisode = null
         
         val targetUrl = if (isDownloaded) {
             offlineEp?.videoUrl ?: currentEpisode.videoUrl
@@ -2129,7 +4053,36 @@ fun PlayerScreen(
         if (!targetUrl.isNullOrBlank()) {
             if (targetUrl.contains(".m3u8") || targetUrl.contains(".mp4") || isDownloaded) {
                 streamUrl = targetUrl
-                subtitlesUrl = offlineEp?.vttUrl ?: currentEpisode.vttUrl
+
+                val storedSubtitle = offlineEp?.vttUrl ?: currentEpisode.vttUrl
+                val localStoredSubtitle = storedSubtitle?.takeIf { path ->
+                    path.startsWith("/") && File(path).isFile
+                }
+                val localUserSubtitle = localStoredSubtitle?.takeIf { isLocalUserSubtitlePath(it) }
+
+                // User-imported subtitles always have the highest priority.
+                // This prevents Kairan from replacing a subtitle the user explicitly selected.
+                val localAssSubtitle = if (localUserSubtitle == null) {
+                    findLocalKairanAssSubtitle(
+                        context = context,
+                        title = anime.title,
+                        episodeNumber = currentEpisode.number,
+                        storedPath = localStoredSubtitle
+                    )
+                } else null
+
+                subtitlesUrl = when {
+                    localUserSubtitle != null -> localUserSubtitle
+                    localAssSubtitle != null -> localAssSubtitle
+                    isDownloaded || isOffline -> localStoredSubtitle
+                    else -> storedSubtitle
+                }
+                subtitleSource = when {
+                    localUserSubtitle != null -> "user"
+                    subtitlesUrl != null -> "offline"
+                    else -> "none"
+                }
+                kairanSubtitleResolved = true
                 isLoading = false
             }
         } else if (isOffline) {
@@ -2137,11 +4090,140 @@ fun PlayerScreen(
         }
     }
 
-    val trackSelector = remember(context) { DefaultTrackSelector(context) }
-    val exoPlayer = remember(context) { 
+    LaunchedEffect(anime.id, anime.title, currentEpisode.number, isOffline, isDownloaded, currentEpisode.vttUrl) {
+        kairanSubtitleResolved = false
+
+        // A user-imported subtitle always wins over Kairan and streaming fallback.
+        val userSubtitle = currentEpisode.vttUrl?.takeIf { isLocalUserSubtitlePath(it) }
+        if (userSubtitle != null) {
+            subtitlesUrl = userSubtitle
+            subtitleSource = "user"
+            kairanSubtitleResolved = true
+            Log.d("Subtitle", "USE_USER_SUBTITLE path=$userSubtitle episode=${currentEpisode.number}")
+            return@LaunchedEffect
+        }
+
+        // First, prefer any ASS that is already stored locally. This also fixes
+        // older downloaded episodes whose OfflineStore entry still points at VTT.
+        val existingAss = withContext(Dispatchers.IO) {
+            findLocalKairanAssSubtitle(
+                context = context,
+                title = anime.title,
+                episodeNumber = currentEpisode.number,
+                storedPath = subtitlesUrl
+            )
+        }
+
+        if (existingAss != null) {
+            subtitlesUrl = existingAss
+            subtitleSource = "kairan"
+            Log.d("Kairan", "PREFER_LOCAL_ASS path=$existingAss episode=${currentEpisode.number}")
+
+            if (isDownloaded) {
+                OfflineStore.saveEpisode(
+                    context = context,
+                    animeId = anime.id,
+                    episode = (offlineEp ?: currentEpisode).copy(vttUrl = existingAss)
+                )
+            }
+            kairanSubtitleResolved = true
+            return@LaunchedEffect
+        }
+
+        // A downloaded episode can be upgraded to ASS automatically when the
+        // device is online. The video itself is never downloaded again.
+        if (!isOffline) {
+            val result: KairanSubtitleResult? = try {
+                withContext(Dispatchers.IO) {
+                    KairanSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                }
+            } catch (e: Exception) {
+                Log.w("Kairan", "AUTO_ASS_SEARCH_FAILED episode=${currentEpisode.number}", e)
+                null
+            }
+
+            when (result) {
+                is KairanSubtitleResult.DirectFile -> {
+                    subtitlesUrl = result.path
+                    subtitleSource = "kairan"
+                    Log.d("Kairan", "PREFER_KAIRAN_ASS path=${result.path} episode=${currentEpisode.number}")
+
+                    if (isDownloaded) {
+                        OfflineStore.saveEpisode(
+                            context = context,
+                            animeId = anime.id,
+                            episode = (offlineEp ?: currentEpisode).copy(vttUrl = result.path)
+                        )
+                    }
+                }
+                null -> {
+                    // Kairan ASS가 없거나 검색에 실패하면 기존 VTT/SRT 자막으로
+                    // 반드시 되돌아간다. Kairan 검색 때문에 원래 있던 자막이
+                    // 사라지지 않도록 현재/오프라인 저장 자막을 그대로 유지한다.
+                    val fallbackSubtitle = currentEpisode.vttUrl
+                        ?: offlineEp?.vttUrl
+                        ?: subtitlesUrl
+
+                    subtitlesUrl = fallbackSubtitle
+                    subtitleSource = when {
+                        fallbackSubtitle.isNullOrBlank() -> "none"
+                        isLocalUserSubtitlePath(fallbackSubtitle) -> "user"
+                        else -> "vtt"
+                    }
+                    Log.w(
+                        "Kairan",
+                        "ASS_NOT_FOUND episode=${currentEpisode.number}; FALLBACK_VTT path=$fallbackSubtitle"
+                    )
+                }
+            }
+        } else {
+            Log.d("Kairan", "OFFLINE_ASS_NOT_FOUND episode=${currentEpisode.number}; keeping existing local subtitle")
+        }
+
+        kairanSubtitleResolved = true
+    }
+
+    // ASS/SSA is rendered by libass instead of Media3's normal SubtitleView.
+    // OVERLAY_OPEN_GL keeps the libass bitmap on a dedicated overlay path so
+    // positioning, styles, animations, karaoke, borders, shadows, etc. stay
+    // faithful to the original ASS script.
+    val assHandler = remember(context) {
+        AssHandler(
+            renderType = AssRenderType.OVERLAY_OPEN_GL,
+            config = AssHandlerConfig(
+                maxRenderPixels = 0
+            )
+        )
+    }
+
+    val assSubtitleParserFactory = remember(assHandler) {
+        AssSubtitleParserFactory(assHandler)
+    }
+
+    val trackSelector = remember(context) {
+        DefaultTrackSelector(context)
+    }
+
+    val exoPlayer = remember(context, trackSelector, assHandler) {
+        val defaultRenderersFactory = DefaultRenderersFactory(context)
+        val assRenderersFactory = AssRenderersFactory(
+            assHandler = assHandler,
+            renderersFactory = defaultRenderersFactory
+        )
+
         ExoPlayer.Builder(context)
             .setTrackSelector(trackSelector)
-            .build() 
+            .setRenderersFactory(assRenderersFactory)
+            .build()
+    }
+
+    DisposableEffect(exoPlayer, assHandler) {
+        Log.d("Subtitle", "LIBASS_INIT renderType=OVERLAY_OPEN_GL maxRenderPixels=0")
+        assHandler.init(exoPlayer)
+        onDispose {
+            Log.d("Subtitle", "LIBASS_RELEASE")
+            assHandler.release()
+        }
     }
 
     val forwardingPlayer = remember(exoPlayer, prevEpisode, nextEpisode) {
@@ -2167,14 +4249,16 @@ fun PlayerScreen(
     }
 
     DisposableEffect(currentEpisode) {
+        val episodeNumberForSave = currentEpisode.number
         onDispose {
+            if (suppressProgressSaveForEpisode == episodeNumberForSave) return@onDispose
             val duration = exoPlayer.duration
             if (duration > 0 && duration != C.TIME_UNSET) {
                 val progress = (exoPlayer.currentPosition.toFloat() / duration).coerceIn(0f, 1f)
                 vm.updateProgress(
                     context = context,
                     animeId = anime.id,
-                    episodeNumber = currentEpisode.number,
+                    episodeNumber = episodeNumberForSave,
                     progress = progress
                 )
             }
@@ -2191,6 +4275,14 @@ fun PlayerScreen(
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
+                    val completedEpisode = currentEpisodeState.number
+                    suppressProgressSaveForEpisode = completedEpisode
+                    vm.updateProgress(
+                        context = context,
+                        animeId = anime.id,
+                        episodeNumber = completedEpisode,
+                        progress = 0f
+                    )
                     if (currentAutoPlay && currentNextEpisode != null) {
                         currentEpisode = currentNextEpisode!!
                     }
@@ -2280,7 +4372,9 @@ fun PlayerScreen(
                 .setCacheReadDataSourceFactory(FileDataSource.Factory())
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
             val dataSourceFactory = DefaultDataSource.Factory(context, cacheDataSourceFactory)
-            DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory)
+            DefaultMediaSourceFactory(context)
+                .setDataSourceFactory(dataSourceFactory)
+                .setSubtitleParserFactory(assSubtitleParserFactory)
         }
 
         val mediaItemUri = if (isLocalFile && !url.startsWith("file://")) {
@@ -2305,9 +4399,27 @@ fun PlayerScreen(
                 subPath.startsWith("file://") -> Uri.parse(subPath)
                 else -> Uri.fromFile(File(subPath))
             }
+            val lowerSubPath = subPath.lowercase(Locale.ROOT)
+            val subtitleMimeType = when {
+                lowerSubPath.contains(".ass") || lowerSubPath.contains(".ssa") -> MimeTypes.TEXT_SSA
+                lowerSubPath.contains(".srt") -> MimeTypes.APPLICATION_SUBRIP
+                else -> MimeTypes.TEXT_VTT
+            }
+            Log.d("Subtitle", "LOAD source=$subtitleSource path=$subPath mime=$subtitleMimeType")
+            val subtitleId = if (subtitleMimeType == MimeTypes.TEXT_SSA) {
+                // libass-android uses the external track id to bind the ASS
+                // stream to AssHandler. Keep it stable and well above the
+                // media track ids used by ExoPlayer.
+                "kairan-ass-${anime.id}-${currentEpisode.number}"
+            } else {
+                "kairan-subtitle-${anime.id}-${currentEpisode.number}"
+            }
+
             val subtitleConfig = MediaItem.SubtitleConfiguration.Builder(subUri)
-                .setMimeType(MimeTypes.TEXT_VTT)
+                .setId(subtitleId)
+                .setMimeType(subtitleMimeType)
                 .setLanguage("ko")
+                .setLabel(if (subtitleMimeType == MimeTypes.TEXT_SSA) "Kairan ASS" else "Kairan Subtitle")
                 .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
                 .build()
             mediaItemBuilder.setSubtitleConfigurations(listOf(subtitleConfig))
@@ -2331,6 +4443,7 @@ fun PlayerScreen(
                             }
                         }
                     }
+
                 }
             }
         }
@@ -2341,9 +4454,192 @@ fun PlayerScreen(
         exoPlayer.playWhenReady = true
     }
 
+    LaunchedEffect(streamUrl, currentEpisode.number) {
+        val currentStreamUrl = streamUrl ?: return@LaunchedEffect
+
+        aniSkipSegments = emptyList()
+        activeAniSkipSegment = null
+        buttonAniSkipSegment = null
+        aniSkipEnteredAtMs = -1L
+        skippedAniSkipKeys = emptySet()
+
+        while (isActive) {
+            val duration = exoPlayer.duration
+            if (
+                exoPlayer.playbackState == Player.STATE_READY &&
+                duration > 0L &&
+                duration != C.TIME_UNSET
+            ) {
+                val durationSeconds = kotlin.math.round(duration / 1000.0).toInt().coerceAtLeast(1)
+                Log.d(
+                    "AniSkip",
+                    "PLAYER_READY_FOR_ANISKIP episode=${currentEpisode.number} duration=$durationSeconds"
+                )
+
+                val segments = AniSkipService.getSkipTimes(
+                    anime.title,
+                    currentEpisode.number,
+                    durationSeconds
+                )
+
+                aniSkipSegments = segments.mapNotNull { segment ->
+                    val source = segment.episodeLength
+                    val local = durationSeconds.toDouble()
+
+                    if (source <= 0.0 || local <= 0.0) {
+                        Log.w(
+                            "AniSkip",
+                            "MAPPED_REJECT type=${segment.type} invalidLengths " +
+                                "source=$source local=$local"
+                        )
+                        return@mapNotNull null
+                    }
+
+                    val diff = local - source
+
+                    // AniSkip의 타임스탬프는 원본 영상의 실제 타임라인이다.
+                    // 길이가 크게 다른 영상에 비율을 곱하면 OP/ED가 전혀 다른 위치로 이동한다.
+                    // 따라서 가까운 길이만 offset 보정하고, 크게 다르면 원본 시간을 그대로 사용한다.
+                    val (start, end, mode) = if (kotlin.math.abs(diff) <= 30.0) {
+                        Triple(
+                            (segment.startTime + diff).coerceIn(0.0, local),
+                            (segment.endTime + diff).coerceIn(0.0, local),
+                            "offset"
+                        )
+                    } else {
+                        Triple(
+                            segment.startTime.coerceIn(0.0, local),
+                            segment.endTime.coerceIn(0.0, local),
+                            "raw_mismatch"
+                        )
+                    }
+
+                    val safeStart = minOf(start, end)
+                    val safeEnd = maxOf(start, end)
+
+                    if (safeEnd <= safeStart) {
+                        Log.w(
+                            "AniSkip",
+                            "MAPPED_REJECT type=${segment.type} invalidMappedRange"
+                        )
+                        return@mapNotNull null
+                    }
+
+                    Log.d(
+                        "AniSkip",
+                        "MAPPED type=${segment.type} " +
+                            "raw=${segment.startTime}-${segment.endTime} " +
+                            "source=$source local=$local diff=$diff " +
+                            "mode=$mode mapped=$safeStart-$safeEnd"
+                    )
+
+                    segment.copy(
+                        startTime = safeStart,
+                        endTime = safeEnd
+                    )
+                }
+
+                skipEpisodeKey = "${anime.id}_${currentEpisode.number}"
+
+                Log.d(
+                    "AniSkip",
+                    "LOADED episode=${currentEpisode.number} count=${aniSkipSegments.size}"
+                )
+                break
+            }
+            delay(250L)
+        }
+    }
+
+    LaunchedEffect(exoPlayer, currentEpisode.number, aniSkipSegments, isAutoSkipEnabled) {
+        val segments = aniSkipSegments
+        if (segments.isEmpty()) {
+            activeAniSkipSegment = null
+            return@LaunchedEffect
+        }
+
+        while (isActive) {
+            val positionSeconds = exoPlayer.currentPosition / 1000.0
+            val active = segments.firstOrNull {
+                positionSeconds >= it.startTime && positionSeconds < it.endTime
+            }
+
+            if (active != activeAniSkipSegment) {
+                activeAniSkipSegment = active
+                buttonAniSkipSegment = active
+                aniSkipEnteredAtMs = if (active != null) System.currentTimeMillis() else -1L
+
+                if (active != null) {
+                    Log.d(
+                        "AniSkip",
+                        "ENTER type=${active.type} position=$positionSeconds range=${active.startTime}-${active.endTime}"
+                    )
+                }
+            }
+
+            if (active == null) {
+                buttonAniSkipSegment = null
+                aniSkipEnteredAtMs = -1L
+            } else if (isAutoSkipEnabled) {
+                val key = "${active.type}:${active.startTime}:${active.endTime}"
+                val elapsedMs = if (aniSkipEnteredAtMs >= 0L) {
+                    System.currentTimeMillis() - aniSkipEnteredAtMs
+                } else {
+                    0L
+                }
+
+                // 버튼이 잠깐 보인 뒤 자동 스킵되도록 한다. 자동 스킵을 끄면
+                // 구간 전체에서 버튼으로 직접 넘길 수 있다.
+                if (key !in skippedAniSkipKeys && elapsedMs >= 1200L) {
+                    val duration = exoPlayer.duration
+                    val targetSeconds = if (duration > 0L && duration != C.TIME_UNSET) {
+                        minOf(active.endTime, duration / 1000.0 - 0.5)
+                    } else {
+                        active.endTime
+                    }
+
+                    if (targetSeconds > positionSeconds + 0.25) {
+                        Log.d(
+                            "AniSkip",
+                            "AUTO_SKIP type=${active.type} position=$positionSeconds target=$targetSeconds elapsedMs=$elapsedMs"
+                        )
+                        skippedAniSkipKeys = skippedAniSkipKeys + key
+                        exoPlayer.seekTo((targetSeconds * 1000.0).toLong().coerceAtLeast(0L))
+                        activeAniSkipSegment = null
+                        buttonAniSkipSegment = null
+                        aniSkipEnteredAtMs = -1L
+                    }
+                }
+            }
+
+            delay(200L)
+        }
+    }
+
     fun applySubtitleSettingsToView(playerView: PlayerView) {
         val subView = playerView.subtitleView ?: return
-        
+
+        val isAss = subtitlesUrl?.lowercase(Locale.ROOT)?.let {
+            it.endsWith(".ass") || it.endsWith(".ssa") ||
+                it.contains(".ass?") || it.contains(".ssa?")
+        } == true
+
+        if (isAss) {
+            // ASS is rendered by libass through AssSubtitleView. Hide Media3's
+            // normal SubtitleView so the same ASS track is not drawn twice.
+            subView.visibility = View.INVISIBLE
+            Log.d(
+                "Subtitle",
+                "ASS_VIEW libass=true renderType=OVERLAY_OPEN_GL media3SubtitleView=hidden"
+            )
+            return
+        }
+
+        // VTT/SRT: use the app's normal subtitle appearance.
+        subView.visibility = View.VISIBLE
+        subView.setApplyEmbeddedStyles(isVttStyleEnabled)
+        subView.setApplyEmbeddedFontSizes(isVttStyleEnabled)
+
         val calculatedSp = 18f * (subtitleSizePercent / 100f)
         subView.setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, calculatedSp)
         subView.setBottomPaddingFraction(0.09f)
@@ -2379,6 +4675,23 @@ fun PlayerScreen(
                                 isControlsVisible = (visibility == View.VISIBLE)
                             })
                             applySubtitleSettingsToView(this)
+
+                            // libass renderer overlay. It is transparent unless an
+                            // ASS track is active, and it follows the PlayerView
+                            // surface size automatically.
+                            val libassOverlay = AssSubtitleView(ctx, assHandler).apply {
+                                tag = "kairan_libass_overlay"
+                                isClickable = false
+                                isFocusable = false
+                            }
+                            addView(
+                                libassOverlay,
+                                android.widget.FrameLayout.LayoutParams(
+                                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+                                )
+                            )
+                            Log.d("Subtitle", "LIBASS_OVERLAY_ATTACHED")
                         }
                     },
                     update = { playerView ->
@@ -2391,7 +4704,16 @@ fun PlayerScreen(
             !isOffline && !videoUrl.isNullOrBlank() -> {
                 StreamUrlExtractor(
                     targetUrl = videoUrl,
-                    onSubtitleFound = { subtitlesUrl = it },
+                    onSubtitleFound = {
+                        if ((subtitleSource == "none" || subtitleSource == "vtt") && kairanSubtitleResolved) {
+                            // Kairan ASS가 없을 때는 스트림에서 제공하는 원래 VTT를 그대로 사용한다.
+                            if (subtitleSource == "none") {
+                                subtitlesUrl = it
+                                subtitleSource = "linkkf-vtt"
+                                Log.d("Subtitle", "USE_LINKKF_VTT url=$it")
+                            }
+                        }
+                    },
                     onQualitiesFound = { qualities ->
                         parsedStreamingQualities = qualities
                         if (streamUrl == null && qualities.isNotEmpty()) {
@@ -2475,7 +4797,75 @@ fun PlayerScreen(
                             modifier = Modifier.scale(0.7f)
                         )
                     }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color.Black.copy(alpha = 0.5f))
+                            .clickable { isAutoSkipEnabled = !isAutoSkipEnabled }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = "OP/ED",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Switch(
+                            checked = isAutoSkipEnabled,
+                            onCheckedChange = { isAutoSkipEnabled = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = Lilac,
+                                uncheckedThumbColor = Color.Gray,
+                                uncheckedTrackColor = Color.DarkGray
+                            ),
+                            modifier = Modifier.scale(0.7f)
+                        )
+                    }
                 }
+            }
+        }
+
+        buttonAniSkipSegment?.let { segment ->
+            val label = if (segment.type == "op" || segment.type == "mixed-op") {
+                "OP 스킵"
+            } else {
+                "ED 스킵"
+            }
+
+            Button(
+                onClick = {
+                    val positionSeconds = exoPlayer.currentPosition / 1000.0
+                    val duration = exoPlayer.duration
+                    val targetSeconds = if (duration > 0L && duration != C.TIME_UNSET) {
+                        minOf(segment.endTime, duration / 1000.0 - 0.5)
+                    } else {
+                        segment.endTime
+                    }
+
+                    Log.d(
+                        "AniSkip",
+                        "BUTTON_SKIP type=${segment.type} position=$positionSeconds target=$targetSeconds"
+                    )
+
+                    skippedAniSkipKeys = skippedAniSkipKeys + "${segment.type}:${segment.startTime}:${segment.endTime}"
+                    activeAniSkipSegment = null
+                    buttonAniSkipSegment = null
+                    aniSkipEnteredAtMs = -1L
+
+                    if (targetSeconds > positionSeconds) {
+                        exoPlayer.seekTo((targetSeconds * 1000.0).toLong().coerceAtLeast(0L))
+                    }
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 20.dp, bottom = 72.dp),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Text(label)
             }
         }
 
@@ -2556,6 +4946,30 @@ fun PlayerScreen(
                         Spacer(Modifier.height(16.dp))
 
                         Text("자막 설정", fontWeight = FontWeight.Bold, color = LilacDark)
+                        Spacer(Modifier.height(10.dp))
+
+                        val currentUserSubtitle = currentEpisode.vttUrl?.takeIf { isLocalUserSubtitlePath(it) }
+                        OutlinedButton(
+                            onClick = {
+                                subtitleFilePickerLauncher.launch(
+                                    arrayOf("text/*", "application/x-subrip", "application/x-ass", "application/octet-stream")
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.Subtitles, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (currentUserSubtitle != null) "사용자 자막 변경" else "자막 파일 불러오기")
+                        }
+                        if (currentUserSubtitle != null) {
+                            Text(
+                                "사용자 자막이 우선 적용됩니다. 오프라인 재생에도 유지됩니다.",
+                                fontSize = 11.sp,
+                                color = Color.Gray,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+
                         Spacer(Modifier.height(10.dp))
 
                         Row(
@@ -2658,6 +5072,450 @@ fun PlayerScreen(
             )
         }
     }
+}
+
+// ============================================================
+// KAIRAN03 BLOGGER + GOOGLE DRIVE SUBTITLE
+// ============================================================
+
+sealed class KairanSubtitleResult {
+    data class DirectFile(val path: String) : KairanSubtitleResult()
+}
+
+object KairanSubtitleService {
+    private const val BLOG_URL = "https://kairan03.blogspot.com"
+    private const val CACHE_DIR = "kairan_subtitles"
+    private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+
+    suspend fun findSubtitle(context: Context, title: String, episodeNumber: Int): KairanSubtitleResult? =
+        withContext(Dispatchers.IO) {
+            try {
+                Log.d("Kairan", "START_SEARCH title=[$title] episode=$episodeNumber")
+
+                val postUrl = findBlogPost(title, episodeNumber)
+                if (postUrl == null) {
+                    Log.w("Kairan", "POST_NOT_FOUND title=[$title] episode=$episodeNumber")
+                    return@withContext null
+                }
+
+                Log.d("Kairan", "POST_FOUND title=[$title] episode=$episodeNumber url=$postUrl")
+                val html = getText(postUrl)
+                Log.d("Kairan", "POST_HTML_LOADED bytes=${html.length}")
+
+                val links = extractGoogleDriveLinks(html)
+                Log.d("Kairan", "DRIVE_LINK_COUNT count=${links.size}")
+
+                for (link in links) {
+                    val id = extractGoogleDriveId(link)
+                    if (id == null) {
+                        Log.w("Kairan", "INVALID_DRIVE_LINK url=$link")
+                        continue
+                    }
+                    Log.d("Kairan", "TRY_DRIVE fileId=$id url=$link")
+                    val local = downloadGoogleDriveSubtitle(context, id, title, episodeNumber)
+                    if (local != null) {
+                        Log.d("Kairan", "SUBTITLE_READY path=$local")
+                        return@withContext KairanSubtitleResult.DirectFile(local)
+                    }
+                }
+
+                Log.w("Kairan", "DRIVE_SUBTITLE_NOT_FOUND url=$postUrl")
+                null
+            } catch (e: Exception) {
+                Log.e("Kairan", "FIND_SUBTITLE_FAILED title=[$title] ep=$episodeNumber", e)
+                null
+            }
+        }
+
+    private data class KairanSearchResult(
+        val title: String,
+        val url: String
+    )
+
+    private suspend fun findBlogPost(title: String, episode: Int): String? {
+        // Search every meaningful title word, but run the independent Blogger
+        // requests concurrently. This keeps the word-by-word search behavior
+        // while removing the serial network wait between words.
+        val normalizedTitle = kairanSearchTitle(title)
+        val words = normalizedTitle
+            .split(' ')
+            .filter { it.length >= 2 }
+            .distinct()
+            .sortedByDescending { it.length }
+
+        if (words.isEmpty()) return null
+
+        val searchQueries = words.toMutableList()
+        // Also keep the compact normalized title as one fallback query.
+        if (normalizedTitle.isNotBlank() && normalizedTitle !in searchQueries) {
+            searchQueries += normalizedTitle
+        }
+
+        val resultsByQuery = coroutineScope {
+            searchQueries.map { query ->
+                async(Dispatchers.IO) {
+                    query to runCatching { searchKairanBlog(query) }.getOrDefault(emptyList())
+                }
+            }.awaitAll()
+        }
+
+        var bestUrl: String? = null
+        var bestScore = Int.MIN_VALUE
+        val seenUrls = HashSet<String>()
+
+        for ((query, results) in resultsByQuery) {
+            Log.d(
+                "Kairan",
+                "BLOG_SEARCH_RESULTS query=[$query] start=0 count=${results.size}"
+            )
+
+            for (result in results) {
+                if (!seenUrls.add(result.url)) continue
+
+                val titleScore = scoreKairanSearchTitle(title, result.title)
+                val episodeMatch = hasKairanEpisode(result.title, result.url, episode)
+
+                if (titleScore <= 0 || !episodeMatch) {
+                    continue
+                }
+
+                if (titleScore > bestScore) {
+                    bestScore = titleScore
+                    bestUrl = result.url
+                    Log.d(
+                        "Kairan",
+                        "BLOG_SEARCH_BEST_UPDATE score=$bestScore query=[$query] " +
+                            "title=[${result.title}] url=${result.url}"
+                    )
+                }
+            }
+        }
+
+        Log.d("Kairan", "BLOG_SEARCH_BEST score=$bestScore url=$bestUrl")
+        return bestUrl
+    }
+
+
+    private fun searchKairanBlog(query: String): List<KairanSearchResult> {
+        return try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = "$BLOG_URL/search?q=$encoded"
+            Log.d("Kairan", "BLOG_SEARCH_REQUEST url=$url")
+
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15000
+                readTimeout = 20000
+                useCaches = false
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", USER_AGENT)
+                setRequestProperty(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                )
+                setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+            }
+
+            try {
+                val code = connection.responseCode
+                val html = (
+                    if (code in 200..299) connection.inputStream
+                    else connection.errorStream
+                )?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+
+                Log.d(
+                    "Kairan",
+                    "BLOG_SEARCH_HTTP code=$code bytes=${html.length} query=[$query]"
+                )
+
+                if (code !in 200..299 || html.isBlank()) return emptyList()
+
+                parseKairanSearchResults(html)
+            } finally {
+                connection.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.w("Kairan", "BLOG_SEARCH_FAILED query=[$query]", e)
+            emptyList()
+        }
+    }
+
+    private fun parseKairanSearchResults(html: String): List<KairanSearchResult> {
+        val out = linkedMapOf<String, KairanSearchResult>()
+
+        // Blogger themes normally render search-result post titles as links
+        // inside .post-title/.entry-title, but custom Kairan themes can vary.
+        // Therefore inspect all anchors and keep only real Blogger post URLs.
+        val anchorRegex = Regex(
+            """<a\b[^>]*href\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+
+        for (match in anchorRegex.findAll(html)) {
+            val rawUrl = htmlDecode(match.groupValues[1]).trim()
+            val rawTitle = htmlDecode(stripHtml(match.groupValues[2])).trim()
+            if (rawTitle.isBlank()) continue
+
+            val postUrl = normalizeKairanPostUrl(rawUrl) ?: continue
+            val key = postUrl.lowercase(Locale.ROOT)
+            if (key !in out) {
+                out[key] = KairanSearchResult(rawTitle, postUrl)
+            }
+        }
+
+        return out.values.toList()
+    }
+
+    private fun normalizeKairanPostUrl(rawUrl: String): String? {
+        val decoded = rawUrl
+            .replace("\\/", "/")
+            .replace("&amp;", "&")
+            .trim()
+
+        val absolute = when {
+            decoded.startsWith("https://kairan03.blogspot.com/") -> decoded
+            decoded.startsWith("http://kairan03.blogspot.com/") ->
+                decoded.replaceFirst("http://", "https://")
+            decoded.startsWith("/") -> "$BLOG_URL$decoded"
+            else -> return null
+        }
+
+        // Blogger post permalinks use /YYYY/MM/slug.html.  Restricting to
+        // these URLs prevents menu/search/category links from becoming posts.
+        return if (
+            Regex(
+                """https?://kairan03\.blogspot\.com/\d{4}/\d{1,2}/[^\s"'<>]+\.html(?:[?#].*)?$""",
+                RegexOption.IGNORE_CASE
+            ).matches(absolute)
+        ) {
+            absolute
+        } else {
+            null
+        }
+    }
+
+    private fun stripHtml(value: String): String {
+        return value
+            .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("<[^>]+>"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun htmlDecode(value: String): String {
+        return value
+            .replace("&amp;", "&", ignoreCase = true)
+            .replace("&quot;", "\"", ignoreCase = true)
+            .replace("&#39;", "'", ignoreCase = true)
+            .replace("&apos;", "'", ignoreCase = true)
+            .replace("&lt;", "<", ignoreCase = true)
+            .replace("&gt;", ">", ignoreCase = true)
+            .replace(Regex("&#(\\d+);")) { m ->
+                m.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: m.value
+            }
+    }
+
+    private fun kairanSearchTitle(value: String): String {
+        return value
+            .lowercase(Locale.ROOT)
+            .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun scoreKairanSearchTitle(query: String, postTitle: String): Int {
+        val left = kairanSearchTitle(query)
+        val right = kairanSearchTitle(postTitle)
+        if (left.isBlank() || right.isBlank()) return 0
+        if (left == right) return 10000
+        if (right.contains(left) || left.contains(right)) return 8000
+
+        val leftWords = left.split(' ').filter { it.isNotBlank() }.toSet()
+        val rightWords = right.split(' ').filter { it.isNotBlank() }.toSet()
+        if (leftWords.isEmpty() || rightWords.isEmpty()) return 0
+
+        val overlap = leftWords.intersect(rightWords).size
+        if (overlap == 0) return 0
+
+        val ratio = overlap.toDouble() / minOf(leftWords.size, rightWords.size).toDouble()
+        return when {
+            ratio >= 0.75 -> 6000
+            ratio >= 0.5 -> 4000
+            else -> 0
+        }
+    }
+
+    private fun hasKairanEpisode(postTitle: String, url: String, episode: Int): Boolean {
+        if (episode <= 0) return false
+
+        val title = kairanSearchTitle(postTitle)
+        val urlText = url.lowercase(Locale.ROOT)
+        val ep = episode.toString()
+
+        val explicitPatterns = listOf(
+            Regex("(?:^|\\s|[\\[\\]\\(\\)_.-])0*$ep(?:\\s*화|\\s*회|\\s*편|\\s*話)(?:$|\\s|[\\[\\]\\(\\)_.-])", RegexOption.IGNORE_CASE),
+            Regex("(?:^|\\s|[\\[\\]\\(\\)_.-])(?:ep|e|episode|#)\\s*0*$ep(?:$|\\s|[\\[\\]\\(\\)_.-])", RegexOption.IGNORE_CASE),
+            Regex("(?:^|\\s|[\\[\\]\\(\\)_.-])0*$ep(?:$|\\s|[\\[\\]\\(\\)_.-])", RegexOption.IGNORE_CASE)
+        )
+
+        if (explicitPatterns.any { it.containsMatchIn(title) }) return true
+
+        val urlEpisode = Regex(
+            "(?:-|_)0*$ep\\.html(?:$|[?#])",
+            RegexOption.IGNORE_CASE
+        )
+        return urlEpisode.containsMatchIn(urlText)
+    }
+
+    private fun extractGoogleDriveLinks(html: String): List<String> {
+        val out = linkedSetOf<String>()
+        val absolute = Regex("""https?://(?:drive|docs)\.google\.com/[^\s\"'<>\\]+""", RegexOption.IGNORE_CASE)
+        absolute.findAll(html).forEach { m ->
+            val u = m.value.replace("&amp;", "&").replace("\\/", "/").trimEnd(')',']','}','\"','\'')
+            if (extractGoogleDriveId(u) != null) out += u
+        }
+        val href = Regex("""href=[\"']([^\"']+)[\"']""", RegexOption.IGNORE_CASE)
+        href.findAll(html).forEach { m ->
+            val u = m.groupValues[1].replace("&amp;", "&").replace("\\/", "/")
+            if (extractGoogleDriveId(u) != null) out += u
+        }
+        return out.toList()
+    }
+
+    private fun extractGoogleDriveId(url: String): String? {
+        Regex("""/file/d/([^/?]+)""").find(url)?.let { return it.groupValues[1] }
+        Regex("""[?&]id=([^&]+)""").find(url)?.let { return it.groupValues[1] }
+        return null
+    }
+
+    private fun downloadGoogleDriveSubtitle(context: Context, fileId: String, title: String, episode: Int): String? {
+        // ASS는 오프라인 재생에 필요하므로 cacheDir이 아니라 filesDir에 영구 보관한다.
+        val dir = File(context.filesDir, CACHE_DIR).apply { mkdirs() }
+        val safe = normalizeTitle(title).replace(' ', '_').ifBlank { "subtitle" }.take(60)
+        val urls = listOf(
+            "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
+            "https://drive.google.com/uc?export=download&id=$fileId"
+        )
+        for (downloadUrl in urls) {
+            val temp = File(dir, "${safe}_${episode}_${System.currentTimeMillis()}.tmp")
+            try {
+                Log.d("Kairan", "DOWNLOAD_REQUEST url=$downloadUrl")
+                val c = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"; connectTimeout = 15000; readTimeout = 60000
+                    instanceFollowRedirects = true; setRequestProperty("User-Agent", USER_AGENT); setRequestProperty("Accept", "*/*")
+                }
+                try {
+                    val code = c.responseCode
+                    Log.d("Kairan", "DOWNLOAD_HTTP code=$code")
+                    if (code !in 200..299) continue
+                    c.inputStream.use { input -> FileOutputStream(temp).use { input.copyTo(it) } }
+                    Log.d("Kairan", "DOWNLOAD_SIZE bytes=${temp.length()}")
+                    if (temp.length() < 100) { Log.w("Kairan", "DOWNLOAD_TOO_SMALL"); temp.delete(); continue }
+                    if (looksLikeHtml(temp)) { Log.w("Kairan", "DOWNLOAD_RETURNED_HTML"); temp.delete(); continue }
+                    if (!isAssFile(temp)) { Log.w("Kairan", "DOWNLOAD_NOT_ASS"); temp.delete(); continue }
+
+                    val assInfo = inspectAssFile(temp)
+                    Log.d(
+                        "Kairan",
+                        "ASS_INFO dialogue=${assInfo.dialogueCount} " +
+                            "positioned=${assInfo.positionedCount} " +
+                            "moving=${assInfo.movingCount} " +
+                            "playRes=${assInfo.playResX}x${assInfo.playResY} " +
+                            "styles=${assInfo.styleCount}"
+                    )
+
+                    val target = File(dir, "${safe}_${episode}.ass")
+                    temp.copyTo(target, overwrite = true); temp.delete()
+                    return target.absolutePath
+                } finally { c.disconnect() }
+            } catch (e: Exception) {
+                Log.w("Kairan", "DOWNLOAD_FAILED url=$downloadUrl", e); temp.delete()
+            }
+        }
+        return null
+    }
+
+    private data class AssInfo(
+        val dialogueCount: Int,
+        val positionedCount: Int,
+        val movingCount: Int,
+        val playResX: Int?,
+        val playResY: Int?,
+        val styleCount: Int
+    )
+
+    private fun inspectAssFile(file: File): AssInfo = try {
+        val text = file.inputStream().bufferedReader().use { it.readText() }
+        val lower = text.lowercase(Locale.ROOT)
+
+        val dialogueLines = text.lineSequence()
+            .filter { it.trimStart().startsWith("dialogue:", ignoreCase = true) }
+            .toList()
+
+        val positioned = dialogueLines.count {
+            Regex("""\\pos\s*\(""", RegexOption.IGNORE_CASE).containsMatchIn(it)
+        }
+
+        val moving = dialogueLines.count {
+            Regex("""\\move\s*\(""", RegexOption.IGNORE_CASE).containsMatchIn(it)
+        }
+
+        val playResX = Regex(
+            """(?im)^\s*playresx\s*[:=]\s*(\d+)"""
+        ).find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        val playResY = Regex(
+            """(?im)^\s*playresy\s*[:=]\s*(\d+)"""
+        ).find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        val styleCount = text.lineSequence().count {
+            val t = it.trimStart()
+            t.startsWith("style:", ignoreCase = true) ||
+                t.startsWith("format:", ignoreCase = true) && lower.contains("[v4+ styles]")
+        }
+
+        AssInfo(
+            dialogueCount = dialogueLines.size,
+            positionedCount = positioned,
+            movingCount = moving,
+            playResX = playResX,
+            playResY = playResY,
+            styleCount = styleCount
+        )
+    } catch (_: Exception) {
+        AssInfo(0, 0, 0, null, null, 0)
+    }
+
+    private fun isAssFile(file: File): Boolean = try {
+        val sample = file.inputStream().bufferedReader().use { it.readText().take(20000).lowercase(Locale.ROOT) }
+        sample.contains("[script info]") && sample.contains("[events]")
+    } catch (_: Exception) { false }
+
+    private fun looksLikeHtml(file: File): Boolean = try {
+        val sample = file.inputStream().bufferedReader().use { it.readText().take(3000).trimStart().lowercase(Locale.ROOT) }
+        sample.startsWith("<!doctype html") || sample.startsWith("<html") || sample.contains("<head")
+    } catch (_: Exception) { false }
+
+    private fun getText(url: String): String {
+        val c = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"; connectTimeout = 15000; readTimeout = 30000; instanceFollowRedirects = true
+            setRequestProperty("User-Agent", USER_AGENT); setRequestProperty("Accept", "text/html,application/xhtml+xml,application/json,*/*")
+        }
+        return try {
+            val code = c.responseCode
+            val text = (if (code in 200..299) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+            if (code !in 200..299) throw IllegalStateException("HTTP $code")
+            text
+        } finally { c.disconnect() }
+    }
+
+    internal fun normalizeTitleForFile(value: String): String = normalizeTitle(value)
+
+    private fun normalizeTitle(value: String): String = value.lowercase(Locale.ROOT)
+        .replace(Regex("""\[[^]]*]"""), " ")
+        .replace(Regex("""\([^)]*\)"""), " ")
+        .replace(Regex("""[^\p{L}\p{N}]+"""), " ")
+        .replace(Regex("""\s+"""), " ").trim()
 }
 
 // ============================================================
