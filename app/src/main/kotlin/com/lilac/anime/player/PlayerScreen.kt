@@ -153,9 +153,12 @@ fun PlayerScreen(
     
     var currentEpisode by remember(episode) { mutableStateOf(episode) }
     
-    var isFullScreen by remember { mutableStateOf(true) }
+    var isFullScreen by rememberSaveable { mutableStateOf(true) }
     var streamUrl by remember { mutableStateOf<String?>(null) }
     var subtitlesUrl by remember { mutableStateOf<String?>(null) }
+    // Linkkf VTT 주소는 한 번 발견되면 자막 소스를 Kairan으로 바꿔도 유지한다.
+    // 그래야 다시 Linkkf VTT를 선택했을 때 재탐색 없이 즉시 전환할 수 있다.
+    var linkkfSubtitleUrl by remember(anime.id, currentEpisode.number) { mutableStateOf<String?>(currentEpisode.vttUrl) }
     var subtitleSource by remember { mutableStateOf("none") }
     var kairanSubtitleResolved by remember { mutableStateOf(false) }
     // 재생 중 백그라운드에서 Kairan ASS를 찾았을 때만 조용히 표시하는 안내창 상태
@@ -324,12 +327,9 @@ fun PlayerScreen(
         }
     }
 
+    // PlayerScreen에서는 뒤로가기 한 번으로 즉시 이전 화면으로 돌아간다.
     BackHandler {
-        if (isFullScreen) {
-            isFullScreen = false
-        } else {
-            back()
-        }
+        back()
     }
 
     // Restore a user-imported subtitle saved in OfflineStore even when the
@@ -352,6 +352,7 @@ fun PlayerScreen(
         isLoading = true
         streamUrl = null
         subtitlesUrl = null
+        linkkfSubtitleUrl = currentEpisode.vttUrl
         subtitleSource = "none"
         kairanSubtitleResolved = false
         parsedStreamingQualities = emptyList()
@@ -407,7 +408,7 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(anime.id, anime.title, currentEpisode.number, isOffline, isDownloaded, currentEpisode.vttUrl, subtitleSourcePreference) {
+    LaunchedEffect(anime.id, anime.title, currentEpisode.number, isOffline, isDownloaded, currentEpisode.vttUrl, linkkfSubtitleUrl, subtitleSourcePreference) {
         kairanSubtitleResolved = false
 
         val userSubtitle = currentEpisode.vttUrl?.takeIf { isLocalUserSubtitlePath(it) }
@@ -470,7 +471,7 @@ fun PlayerScreen(
                 }
             }
         } else {
-            val linkkf = currentEpisode.vttUrl
+            val linkkf = linkkfSubtitleUrl ?: currentEpisode.vttUrl
             subtitlesUrl = linkkf
             subtitleSource = if (!linkkf.isNullOrBlank()) "linkkf-vtt" else "none"
         }
@@ -593,6 +594,20 @@ fun PlayerScreen(
         }
     }
 
+    // PlayerScreen이 실제로 종료될 때만 화면 방향과 시스템 바를 복원한다.
+    DisposableEffect(activity) {
+        onDispose {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            activity?.window?.let { window ->
+                WindowCompat.getInsetsController(
+                    window,
+                    window.decorView
+                ).show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
+    // ExoPlayer lifecycle은 화면 방향과 분리해서 관리한다.
     DisposableEffect(exoPlayer) {
         onDispose {
             exoPlayer.release()
@@ -1002,10 +1017,23 @@ fun PlayerScreen(
 
         // Media3 버전에 따라 bottomPaddingFraction이 재측정 시 되돌아가는 경우가 있어
         // 실제 padding도 함께 갱신하고 즉시 invalidate/requestLayout 한다.
-        val bottomPx = (subView.height.coerceAtLeast(1) * positionFraction).toInt()
-        subView.setPadding(subView.paddingLeft, subView.paddingTop, subView.paddingRight, bottomPx)
+        fun applyPositionAfterLayout() {
+            subView.setBottomPaddingFraction(positionFraction)
+            val bottomPx = (subView.height * positionFraction).toInt().coerceAtLeast(0)
+            subView.setPadding(
+                subView.paddingLeft,
+                subView.paddingTop,
+                subView.paddingRight,
+                bottomPx
+            )
+            subView.invalidate()
+        }
+
+        // 최초 AndroidView 생성 시에는 SubtitleView 높이가 아직 0일 수 있다.
+        // post()로 레이아웃 이후 한 번 더 적용해 처음 표시되는 VTT에도 위치 설정을 반영한다.
         subView.requestLayout()
-        subView.invalidate()
+        subView.post { applyPositionAfterLayout() }
+        applyPositionAfterLayout()
 
         val transparentStyle = CaptionStyleCompat(
             vm.playerSettings.textColor,
@@ -1070,11 +1098,16 @@ fun PlayerScreen(
             !isOffline && !videoUrl.isNullOrBlank() -> {
                 StreamUrlExtractor(
                     targetUrl = videoUrl,
-                    onSubtitleFound = {
-                        if (kairanSubtitleResolved && subtitleSourcePreference == "linkkf") {
-                            subtitlesUrl = it
+                    onSubtitleFound = { foundUrl ->
+                        // 발견한 VTT를 항상 보관한다. Kairan을 보고 있는 동안 발견되어도
+                        // 나중에 Linkkf VTT를 선택하면 즉시 다시 사용할 수 있어야 한다.
+                        linkkfSubtitleUrl = foundUrl
+                        if (subtitleSourcePreference == "linkkf") {
+                            subtitlesUrl = foundUrl
                             subtitleSource = "linkkf-vtt"
-                            Log.d("Subtitle", "USE_LINKKF_VTT url=$it")
+                            Log.d("Subtitle", "USE_LINKKF_VTT url=$foundUrl")
+                        } else {
+                            Log.d("Subtitle", "CACHE_LINKKF_VTT url=$foundUrl")
                         }
                     },
                     onQualitiesFound = { qualities ->
@@ -1182,7 +1215,7 @@ fun PlayerScreen(
             ) {
                 IconButton(
                     onClick = {
-                        if (isFullScreen) isFullScreen = false else back()
+                        back()
                     }
                 ) {
                     Icon(
