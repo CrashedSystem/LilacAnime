@@ -114,6 +114,25 @@ fun SettingsScreen(
                 }
             }
 
+            Spacer(Modifier.height(24.dp))
+
+            Text(
+                "더블 탭 이동 (${settings.doubleTapSeekSeconds}초)",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            Text("재생 화면의 왼쪽/오른쪽을 두 번 탭하면 지정한 시간만큼 뒤로/앞으로 이동합니다.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f))
+            Spacer(Modifier.height(8.dp))
+            Slider(
+                value = settings.doubleTapSeekSeconds.toFloat(),
+                onValueChange = { value ->
+                    vm.updatePlayerSettings(context, settings.copy(doubleTapSeekSeconds = value.toInt()))
+                },
+                valueRange = 5f..60f,
+                steps = 10
+            )
+
             Spacer(Modifier.height(16.dp))
 
             Text("기본 자막 폰트", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onBackground)

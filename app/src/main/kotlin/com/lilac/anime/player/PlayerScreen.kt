@@ -9,6 +9,9 @@ import android.net.Uri
 import android.util.Log
 import android.util.TypedValue
 import android.view.View
+import android.view.MotionEvent
+import android.view.GestureDetector
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -17,12 +20,17 @@ import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import kotlinx.coroutines.Job
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -36,8 +44,10 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -80,6 +90,53 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
+private fun loadCsoraFontsForSubtitle(context: Context, subtitlePath: String, assHandler: AssHandler): Int {
+    val subtitleFile = File(subtitlePath)
+    val candidates = linkedSetOf<File>()
+
+    subtitleFile.parentFile?.let { parent ->
+        candidates += File(parent, "fonts")
+    }
+
+    val root = File(context.filesDir, "csora_subtitles")
+    if (root.isDirectory) {
+        subtitleFile.parentFile?.name?.let { titleKey ->
+            candidates += File(root, "$titleKey/fonts")
+        }
+    }
+
+    fun collectFonts(dir: File): List<File> =
+        dir.walkTopDown()
+            .filter { file ->
+                file.isFile && file.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc")
+            }
+            .toList()
+
+    val fontFiles = candidates
+        .filter { it.isDirectory }
+        .flatMap(::collectFonts)
+        .distinctBy { it.absolutePath }
+
+    var loaded = 0
+    for (font in fontFiles) {
+        try {
+            val bytes = font.readBytes()
+            // libass receives the original attachment/file name together with the
+            // binary font data. Keep the extension and original basename intact.
+            assHandler.addFont(font.name, bytes)
+            loaded++
+            Log.d("Csora", "ASS_FONT_LOADED name=${font.name} size=${font.length()}")
+        } catch (e: Exception) {
+            Log.w("Csora", "ASS_FONT_LOAD_FAILED name=${font.name}", e)
+        }
+    }
+
+    if (fontFiles.isEmpty()) {
+        Log.w("Csora", "ASS_FONT_NONE subtitle=$subtitlePath candidates=${candidates.joinToString { it.absolutePath }}")
+    }
+    return loaded
+}
+
 private fun isLocalUserSubtitlePath(path: String?): Boolean {
     if (path.isNullOrBlank()) return false
     val file = File(path)
@@ -161,6 +218,9 @@ fun PlayerScreen(
     var linkkfSubtitleUrl by remember(anime.id, currentEpisode.number) { mutableStateOf<String?>(currentEpisode.vttUrl) }
     var subtitleSource by remember { mutableStateOf("none") }
     var kairanSubtitleResolved by remember { mutableStateOf(false) }
+    var csoraSubtitleResolved by remember { mutableStateOf(false) }
+    var discoveredCsoraAssPath by remember { mutableStateOf<String?>(null) }
+    var showCsoraAssPrompt by remember { mutableStateOf(false) }
     // 재생 중 백그라운드에서 Kairan ASS를 찾았을 때만 조용히 표시하는 안내창 상태
     var discoveredKairanAssPath by remember(anime.id, currentEpisode.number) { mutableStateOf<String?>(null) }
     var showKairanAssPrompt by remember(anime.id, currentEpisode.number) { mutableStateOf(false) }
@@ -170,6 +230,7 @@ fun PlayerScreen(
     var isAutoPlayEnabled by rememberSaveable { mutableStateOf(true) }
     var isAutoSkipEnabled by rememberSaveable { mutableStateOf(true) }
     var isControlsVisible by remember { mutableStateOf(true) }
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
     var isPlayerLocked by rememberSaveable { mutableStateOf(false) }
     var showLockedButton by remember { mutableStateOf(false) }
     var lockedButtonRequest by remember { mutableIntStateOf(0) }
@@ -319,17 +380,28 @@ fun PlayerScreen(
         offlineEp = OfflineStore.getEpisode(context, anime.id, currentEpisode.number)
     }
 
+    // 재생 화면에 들어와 있는 동안에는 상태바/내비게이션바 등 시스템 UI를
+    // 항상 숨긴다. 기기별로 transient bar가 다시 나타나는 문제를 줄이기 위해
+    // WindowInsets와 legacy immersive flags를 함께 적용한다.
     LaunchedEffect(isFullScreen) {
         activity?.window?.let { window ->
-            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-            if (isFullScreen) {
-                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                insetsController.hide(WindowInsetsCompat.Type.systemBars())
-                insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            } else {
-                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                insetsController.show(WindowInsetsCompat.Type.systemBars())
-            }
+            val decorView = window.decorView
+            val insetsController = WindowCompat.getInsetsController(window, decorView)
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+            insetsController.hide(
+                WindowInsetsCompat.Type.statusBars() or
+                    WindowInsetsCompat.Type.navigationBars() or
+                    WindowInsetsCompat.Type.captionBar()
+            )
+            @Suppress("DEPRECATION")
+            decorView.systemUiVisibility =
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
         }
     }
 
@@ -395,14 +467,19 @@ fun PlayerScreen(
                 val localKairan = withContext(Dispatchers.IO) {
                     SubtitleStore.get(context, anime.id, currentEpisode.number, "kairan")
                 } ?: findLocalKairanAssSubtitle(context, anime.title, currentEpisode.number, localStoredSubtitle)
+                val localCsora = withContext(Dispatchers.IO) {
+                    SubtitleStore.get(context, anime.id, currentEpisode.number, "csora")
+                }
                 subtitlesUrl = when {
                     localUserSubtitle != null -> localUserSubtitle
-                    subtitleSourcePreference == "kairan" -> localKairan ?: localLinkkf
+                    subtitleSourcePreference == "kairan" -> localKairan ?: localCsora ?: localLinkkf
+                    subtitleSourcePreference == "csora" -> localCsora ?: localKairan ?: localLinkkf
                     else -> localLinkkf ?: localKairan
                 }
                 subtitleSource = when {
                     localUserSubtitle != null -> "user"
                     subtitlesUrl == localKairan && localKairan != null -> "kairan"
+                    subtitlesUrl == localCsora && localCsora != null -> "csora"
                     subtitlesUrl != null -> "linkkf-vtt"
                     else -> "none"
                 }
@@ -438,14 +515,21 @@ fun PlayerScreen(
             val localKairan = withContext(Dispatchers.IO) {
                 SubtitleStore.get(context, anime.id, currentEpisode.number, "kairan")
             } ?: findLocalKairanAssSubtitle(context, anime.title, currentEpisode.number, localStoredSubtitle)
+            val localCsora = withContext(Dispatchers.IO) {
+                SubtitleStore.get(context, anime.id, currentEpisode.number, "csora")
+            }
             when (subtitleSourcePreference) {
                 "kairan" -> {
-                    subtitlesUrl = localKairan ?: localLinkkf
-                    subtitleSource = if (localKairan != null) "kairan" else if (localLinkkf != null) "linkkf-vtt" else "none"
+                    subtitlesUrl = localKairan ?: localCsora ?: localLinkkf
+                    subtitleSource = when { localKairan != null -> "kairan"; localCsora != null -> "csora"; localLinkkf != null -> "linkkf-vtt"; else -> "none" }
+                }
+                "csora" -> {
+                    subtitlesUrl = localCsora ?: localKairan ?: localLinkkf
+                    subtitleSource = when { localCsora != null -> "csora"; localKairan != null -> "kairan"; localLinkkf != null -> "linkkf-vtt"; else -> "none" }
                 }
                 else -> {
-                    subtitlesUrl = localLinkkf ?: localKairan
-                    subtitleSource = if (localLinkkf != null) "linkkf-vtt" else if (localKairan != null) "kairan" else "none"
+                    subtitlesUrl = localLinkkf ?: localKairan ?: localCsora
+                    subtitleSource = when { localLinkkf != null -> "linkkf-vtt"; localKairan != null -> "kairan"; localCsora != null -> "csora"; else -> "none" }
                 }
             }
             kairanSubtitleResolved = true
@@ -475,6 +559,27 @@ fun PlayerScreen(
                     subtitleSource = "none"
                     Log.d("Kairan", "NO_KAIRAN_SUBTITLE episode=${currentEpisode.number}; waiting for Linkkf VTT fallback")
                 }
+            }
+        } else if (subtitleSourcePreference == "csora") {
+            // Switching to Csora must replace the currently displayed subtitle immediately.
+            subtitleSource = "none"
+            subtitlesUrl = null
+            val result = try {
+                withContext(Dispatchers.IO) {
+                    CsoraSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                }
+            } catch (e: Exception) {
+                Log.w("Csora", "SUBTITLE_SEARCH_FAILED episode=${currentEpisode.number}", e)
+                null
+            }
+            if (result is KairanSubtitleResult.DirectFile) {
+                subtitlesUrl = result.path
+                subtitleSource = "csora"
+                Log.d("Csora", "USE_CSORA path=${result.path} episode=${currentEpisode.number}")
+            } else {
+                subtitlesUrl = null
+                subtitleSource = "none"
+                Log.d("Csora", "NO_CSORA_SUBTITLE episode=${currentEpisode.number}")
             }
         } else {
             val linkkf = linkkfSubtitleUrl ?: currentEpisode.vttUrl
@@ -566,6 +671,26 @@ fun PlayerScreen(
         exoPlayer.setPlaybackSpeed(playbackSpeed)
     }
 
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                MainActivity.isVideoPlaying = isPlaying
+                val window = activity?.window
+                if (isPlaying) {
+                    window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                } else {
+                    window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+            MainActivity.isVideoPlaying = false
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     val forwardingPlayer = remember(exoPlayer, prevEpisode, nextEpisode) {
         object : ForwardingPlayer(exoPlayer) {
             override fun isCommandAvailable(command: Int): Boolean {
@@ -614,6 +739,8 @@ fun PlayerScreen(
                     window,
                     window.decorView
                 ).show(WindowInsetsCompat.Type.systemBars())
+                @Suppress("DEPRECATION")
+                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
             }
         }
     }
@@ -693,7 +820,7 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(streamUrl, subtitlesUrl, syncOffsetMs, isOffline) {
+    LaunchedEffect(streamUrl, subtitlesUrl, subtitleSource, syncOffsetMs, isOffline) {
         val url = streamUrl ?: return@LaunchedEffect
         val isLocalFile = url.startsWith("file://") || url.startsWith("/")
 
@@ -755,17 +882,30 @@ fun PlayerScreen(
                 else -> MimeTypes.TEXT_VTT
             }
 
-            val effectiveSubtitlePath = if (
-                syncOffsetMs != 0L &&
-                subtitleMimeType != MimeTypes.TEXT_SSA
-            ) {
+            // Sync is always controlled by the user. Csora does not receive a
+            // global offset because only some individual episodes may need tuning.
+            val effectiveSyncOffsetMs = syncOffsetMs
+
+            // libass does not automatically use arbitrary files extracted next to
+            // an external ASS subtitle. Register Csora's extracted TTF/OTF/TTC
+            // files with AssHandler before the subtitle track is created.
+            if (subtitleSource == "csora" &&
+                (lowerSubPath.endsWith(".ass") || lowerSubPath.endsWith(".ssa"))) {
+                val loadedFonts = withContext(Dispatchers.IO) {
+                    loadCsoraFontsForSubtitle(context, subPath, assHandler)
+                }
+                Log.d("Csora", "ASS_FONT_COUNT loaded=$loadedFonts subtitle=$subPath")
+            }
+
+            // Existing sync controls create shifted files for WebVTT/SRT/ASS/SSA.
+            val effectiveSubtitlePath = if (effectiveSyncOffsetMs != 0L) {
                 withContext(Dispatchers.IO) {
                     prepareSyncedSubtitleFile(
                         context = context,
                         subtitlePath = subPath,
                         animeId = anime.id,
                         episodeNumber = currentEpisode.number,
-                        offsetMs = syncOffsetMs
+                        offsetMs = effectiveSyncOffsetMs
                     )
                 } ?: subPath
             } else subPath
@@ -781,14 +921,11 @@ fun PlayerScreen(
             Log.d(
                 "Subtitle",
                 "LOAD source=$subtitleSource path=$subPath effective=$effectiveSubtitlePath " +
-                    "mime=$subtitleMimeType syncOffsetMs=$syncOffsetMs"
+                    "mime=$subtitleMimeType syncOffsetMs=$syncOffsetMs effectiveSyncOffsetMs=$effectiveSyncOffsetMs"
             )
 
-            val subtitleId = if (subtitleMimeType == MimeTypes.TEXT_SSA) {
-                "kairan-ass-${anime.id}-${currentEpisode.number}"
-            } else {
-                "${subtitleSource}-subtitle-${anime.id}-${currentEpisode.number}-${syncOffsetMs}"
-            }
+            val subtitleId =
+                "${subtitleSource}-subtitle-${anime.id}-${currentEpisode.number}-${effectiveSyncOffsetMs}"
 
             val subtitleConfig = MediaItem.SubtitleConfiguration.Builder(subUri)
                 .setId(subtitleId)
@@ -797,6 +934,7 @@ fun PlayerScreen(
                 .setLabel(
                     when {
                         subtitleSource == "kairan" -> "Kairan ASS"
+                        subtitleSource == "csora" -> "Csora ASS"
                         subtitleSource == "linkkf-vtt" -> "Linkkf VTT"
                         else -> "Subtitle"
                     }
@@ -1070,9 +1208,29 @@ fun PlayerScreen(
                 AndroidView(
                     factory = { ctx ->
                         PlayerView(ctx).apply {
+                            playerViewRef = this
                             player = forwardingPlayer
                             useController = !isPlayerLocked
                             controllerShowTimeoutMs = 2000
+
+                            // Compose pointerInput으로 PlayerView 위를 덮지 않고 View 레벨에서 더블탭 seek 처리
+                            // ExoPlayer Controller(재생바/버튼)의 터치를 유지한다.
+                            val gestureDetector = GestureDetector(ctx, object : GestureDetector.SimpleOnGestureListener() {
+                                override fun onDoubleTap(e: MotionEvent): Boolean {
+                                    val seconds = vm.playerSettings.doubleTapSeekSeconds
+                                    val delta = seconds * 1000L
+                                    if (e.x < width / 2f) {
+                                        player?.seekTo((player?.currentPosition ?: 0L) - delta)
+                                    } else {
+                                        player?.seekTo((player?.currentPosition ?: 0L) + delta)
+                                    }
+                                    return true
+                                }
+                            })
+                            setOnTouchListener { _, event ->
+                                gestureDetector.onTouchEvent(event)
+                                false
+                            }
                             setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
                                 isControlsVisible = (visibility == View.VISIBLE)
                             })
@@ -1097,6 +1255,7 @@ fun PlayerScreen(
                         }
                     },
                     update = { playerView ->
+                    playerViewRef = playerView
                     val settingsButton = playerView.findViewById<View>(androidx.media3.ui.R.id.exo_settings)
                     settingsButton?.visibility = View.GONE
                     playerView.player = forwardingPlayer
@@ -1138,6 +1297,67 @@ fun PlayerScreen(
                     text = if (isOffline) "오프라인 상태이며 다운로드된 영상이 없습니다." else "영상을 불러올 수 없습니다.",
                     color = Color.White
                 )
+            }
+        }
+
+        // 좌/우 더블 탭으로 사용자가 설정한 시간만큼 뒤로/앞으로 이동한다.
+        // 연속 더블 탭은 누적 시간을 표시하고, 물결 애니메이션으로 피드백을 준다.
+        if (!isPlayerLocked) {
+            var playerWidth by remember { mutableIntStateOf(0) }
+            var seekFeedbackDirection by remember { mutableIntStateOf(0) } // -1: 뒤로, +1: 앞으로
+            var seekFeedbackSeconds by remember { mutableIntStateOf(0) }
+            var showSeekFeedback by remember { mutableStateOf(false) }
+            val seekRipple = remember { Animatable(0f) }
+            val seekScope = rememberCoroutineScope()
+            var seekFeedbackJob by remember { mutableStateOf<Job?>(null) }
+
+            Box(
+                modifier = Modifier
+                    // 영상 영역만 더블탭을 처리하고 하단 PlayerView 컨트롤/재생바는 그대로 터치를 받는다.
+                    .fillMaxSize()
+                    .padding(bottom = 90.dp)
+                    .onSizeChanged { playerWidth = it.width }
+            ) {
+                // YouTube처럼 아이콘 없이 화면 좌/우에서 반원형 오버레이가 짧게 퍼진다.
+                if (showSeekFeedback && seekFeedbackDirection != 0) {
+                    val feedbackAlignment = if (seekFeedbackDirection < 0) {
+                        Alignment.CenterStart
+                    } else {
+                        Alignment.CenterEnd
+                    }
+
+                    // Animatable 값에 따라 화면 바깥쪽에서 큰 원이 퍼져 들어오는 느낌을 만든다.
+                    val rippleScale = 0.55f + seekRipple.value * 0.85f
+                    val rippleAlpha = (1f - seekRipple.value * 0.35f).coerceIn(0f, 1f)
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize(),
+                        contentAlignment = feedbackAlignment
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(520.dp)
+                                .scale(rippleScale)
+                                .alpha(0.32f * rippleAlpha)
+                                .background(Color.Black, CircleShape)
+                        )
+
+                        // YouTube 스타일처럼 숫자만 간단히 표시한다.
+                        Text(
+                            text = "${seekFeedbackSeconds}초",
+                            modifier = Modifier
+                                .align(
+                                    if (seekFeedbackDirection < 0) Alignment.CenterStart
+                                    else Alignment.CenterEnd
+                                )
+                                .padding(horizontal = 72.dp),
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 18.sp
+                        )
+                    }
+                }
             }
         }
 
@@ -1508,7 +1728,7 @@ fun PlayerScreen(
 
                         Text("자막 소스", fontWeight = FontWeight.Bold, color = LilacDark)
                         Text(
-                            "다운로드 시 Linkkf VTT와 Kairan ASS를 모두 저장하고, 재생할 소스를 여기서 선택합니다.",
+                            "다운로드된 Linkkf VTT, Kairan ASS, Csora ASS 중 재생할 소스를 여기서 바로 선택합니다.",
                             fontSize = 11.sp,
                             color = Color.Gray
                         )
@@ -1519,13 +1739,28 @@ fun PlayerScreen(
                         ) {
                             FilterChip(
                                 selected = subtitleSourcePreference == "linkkf",
-                                onClick = { subtitleSourcePreference = "linkkf" },
+                                onClick = {
+                                    subtitleSourcePreference = "linkkf"
+                                    vm.updatePlayerSettings(context, vm.playerSettings.copy(subtitleSourcePreference = "linkkf"))
+                                },
                                 label = { Text("Linkkf VTT") }
                             )
                             FilterChip(
                                 selected = subtitleSourcePreference == "kairan",
-                                onClick = { subtitleSourcePreference = "kairan" },
+                                onClick = {
+                                    subtitleSourcePreference = "kairan"
+                                    vm.updatePlayerSettings(context, vm.playerSettings.copy(subtitleSourcePreference = "kairan"))
+                                },
                                 label = { Text("Kairan ASS") }
+                            )
+                            FilterChip(
+                                selected = subtitleSourcePreference == "csora",
+                                onClick = {
+                                    subtitleSourcePreference = "csora"
+                                    // Do not wait for the dialog's 확인 button: preference changes are live.
+                                    vm.updatePlayerSettings(context, vm.playerSettings.copy(subtitleSourcePreference = "csora"))
+                                },
+                                label = { Text("Csora ASS") }
                             )
                         }
                         Text(

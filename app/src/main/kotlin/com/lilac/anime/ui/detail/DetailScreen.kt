@@ -97,8 +97,11 @@ fun DetailScreen(
         val kairanReady = withContext(Dispatchers.IO) {
             SubtitleStore.get(context, currentAnime.id, ep.number, "kairan")
         } ?: findLocalKairanAssSubtitle(context, currentAnime.title, ep.number, legacyPath)
+        val csoraReady = withContext(Dispatchers.IO) {
+            SubtitleStore.get(context, currentAnime.id, ep.number, "csora")
+        }
 
-        if (linkkfReady != null && kairanReady != null) return
+        if (linkkfReady != null && kairanReady != null && csoraReady != null) return
 
         Log.d(
             "Subtitle",
@@ -133,8 +136,22 @@ fun DetailScreen(
                 }
             }
 
+            var csoraPath = csoraReady
+            if (csoraPath == null) {
+                csoraPath = try {
+                    when (val result = CsoraSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
+                        is KairanSubtitleResult.DirectFile -> result.path
+                        null -> null
+                    }
+                } catch (e: Exception) {
+                    Log.w("Csora", "OFFLINE_ASS_REPAIR_FAILED episode=${ep.number}", e)
+                    null
+                }
+            }
+
             SubtitleStore.save(context, currentAnime.id, ep.number, "linkkf", linkkfPath)
             SubtitleStore.save(context, currentAnime.id, ep.number, "kairan", kairanPath)
+            SubtitleStore.save(context, currentAnime.id, ep.number, "csora", csoraPath)
 
             if (linkkfPath != null || kairanPath != null) {
                 val currentStored = OfflineStore.getEpisode(context, currentAnime.id, ep.number)
@@ -143,7 +160,7 @@ fun DetailScreen(
                     currentAnime.id,
                     (currentStored ?: ep).copy(
                         videoUrl = currentStored?.videoUrl ?: ep.videoUrl,
-                        vttUrl = linkkfPath ?: kairanPath ?: currentStored?.vttUrl ?: ep.vttUrl
+                        vttUrl = linkkfPath ?: kairanPath ?: csoraPath ?: currentStored?.vttUrl ?: ep.vttUrl
                     )
                 )
             }

@@ -16,6 +16,8 @@ import android.net.Uri
 import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
+import android.app.PictureInPictureParams
+import android.util.Rational
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -147,6 +149,21 @@ import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        var isVideoPlaying: Boolean = false
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (isVideoPlaying && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            enterPictureInPictureMode(
+                PictureInPictureParams.Builder()
+                    .setAspectRatio(Rational(16, 9))
+                    .build()
+            )
+        }
+    }
 
     private var refreshInstallPermission: (() -> Unit)? = null
 

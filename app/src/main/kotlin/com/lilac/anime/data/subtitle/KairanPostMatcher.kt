@@ -2,6 +2,8 @@ package com.lilac.anime
 
 import java.util.Locale
 import com.lilac.anime.data.matcher.HangulSimilarityMatcher
+import android.util.Log
+import com.lilac.anime.data.subtitle.KairanTitleNormalizer
 
 data class KairanPost(val title: String, val url: String)
 data class KairanMatch(val post: KairanPost, val similarity: Double)
@@ -11,11 +13,17 @@ object KairanPostMatcher {
 
     fun findBestMatch(animeTitle: String, episodeNumber: Int, posts: List<KairanPost>): KairanMatch? {
         if (animeTitle.isBlank() || episodeNumber <= 0) return null
+        val normalizedAnimeTitle = KairanTitleNormalizer.normalize(animeTitle)
+        Log.d("KairanMatcher", "QUERY_NORMALIZED original=[$animeTitle] normalized=[$normalizedAnimeTitle] posts=${posts.size}")
+
         val candidates = posts.asSequence()
             .filter { episodeMatch(it.title, it.url, episodeNumber) }
             .map { post ->
                 val candidateTitle = removeEpisodeTokens(post.title, episodeNumber)
-                KairanMatch(post, weightedSimilarity(animeTitle, candidateTitle))
+                val normalizedCandidate = KairanTitleNormalizer.normalize(candidateTitle)
+                val score = weightedSimilarity(normalizedAnimeTitle, normalizedCandidate)
+                Log.d("KairanMatcher", "COMPARE query=[$normalizedAnimeTitle] candidate=[${post.title}] normalized=[$normalizedCandidate] score=$score")
+                KairanMatch(post, score)
             }
             .toList()
         return candidates.maxByOrNull { it.similarity }?.takeIf { it.similarity >= MIN_SIMILARITY }

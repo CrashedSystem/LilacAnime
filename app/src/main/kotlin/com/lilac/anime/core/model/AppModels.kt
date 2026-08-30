@@ -21,10 +21,12 @@ data class PlayerSettings(
     val syncOffsetMs: Long = 0L,
     // Media3 SubtitleView 기준: 값이 클수록 VTT/SRT 자막이 화면 위쪽으로 올라간다.
     val subtitleBottomPaddingFraction: Float = 0.12f,
-    // 자막 소스: "linkkf" = Linkkf VTT, "kairan" = Kairan ASS
+    // 자막 소스: "linkkf" = Linkkf VTT, "kairan" = Kairan ASS, "csora" = Csora ASS
     val subtitleSourcePreference: String = "linkkf",
     val customFontPath: String? = null,
-    val showAniSkipButton: Boolean = true
+    val showAniSkipButton: Boolean = true,
+    // 좌/우 더블 탭 시 이동할 시간(초)
+    val doubleTapSeekSeconds: Int = 10
 )
 
 data class ExoVideoQualityOption(

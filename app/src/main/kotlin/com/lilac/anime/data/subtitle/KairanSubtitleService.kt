@@ -2,6 +2,7 @@ package com.lilac.anime
 
 import android.content.Context
 import android.util.Log
+import com.lilac.anime.data.subtitle.KairanTitleNormalizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -20,6 +21,8 @@ object KairanSubtitleService {
         withContext(Dispatchers.IO) {
             try {
                 Log.d(TAG, "START_SEARCH title=[$title] episode=$episodeNumber")
+                val normalizedTitle = KairanTitleNormalizer.normalize(title)
+                Log.d(TAG, "NORMALIZED_TITLE original=[$title] normalized=[$normalizedTitle]")
 
                 SubtitleStore.get(context, normalizeTitleForFile(title), episodeNumber, "kairan")
                     ?.takeIf { File(it).isFile }

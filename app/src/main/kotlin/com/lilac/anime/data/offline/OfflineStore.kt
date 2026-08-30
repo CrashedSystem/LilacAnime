@@ -32,12 +32,32 @@ object OfflineStore {
             putString("pref_subtitle_source", settings.subtitleSourcePreference)
             putString("pref_custom_font_path", settings.customFontPath)
             putBoolean("pref_show_ani_skip_button", settings.showAniSkipButton)
+            putInt("pref_double_tap_seek_seconds", settings.doubleTapSeekSeconds)
             apply()
         }
     }
 
     suspend fun getPlayerSettings(context: Context): PlayerSettings = withContext(Dispatchers.IO) {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+
+        // Older Csora builds temporarily applied a global +1000ms offset. That
+        // offset was stored in the normal player preference, so clear only that
+        // one legacy value once and then leave all future user adjustments alone.
+        val syncOffset = prefs.getLong("pref_sync_offset_ms", 0L)
+        val migratedLegacyCsoraSync = prefs.getBoolean("migrated_legacy_csora_sync_1000", false)
+        val normalizedSyncOffset = if (!migratedLegacyCsoraSync && syncOffset == 1000L) {
+            prefs.edit()
+                .putLong("pref_sync_offset_ms", 0L)
+                .putBoolean("migrated_legacy_csora_sync_1000", true)
+                .apply()
+            0L
+        } else {
+            if (!migratedLegacyCsoraSync) {
+                prefs.edit().putBoolean("migrated_legacy_csora_sync_1000", true).apply()
+            }
+            syncOffset
+        }
+
         PlayerSettings(
             defaultQuality = prefs.getString("pref_default_quality", "1080p") ?: "1080p",
             subtitleFont = prefs.getString("pref_subtitle_font", "기본체") ?: "기본체",
@@ -45,15 +65,16 @@ object OfflineStore {
             textColor = prefs.getInt("pref_text_color", android.graphics.Color.WHITE),
             backgroundColor = prefs.getInt("pref_background_color", android.graphics.Color.TRANSPARENT),
             strokeColor = prefs.getInt("pref_stroke_color", android.graphics.Color.BLACK),
-            syncOffsetMs = prefs.getLong("pref_sync_offset_ms", 0L),
+            syncOffsetMs = normalizedSyncOffset,
             subtitleBottomPaddingFraction = prefs.getFloat(
                 "pref_subtitle_bottom_padding_fraction",
                 0.12f
             ).coerceIn(0.03f, 0.45f),
             subtitleSourcePreference = prefs.getString("pref_subtitle_source", "linkkf")
-                ?.takeIf { it == "linkkf" || it == "kairan" } ?: "linkkf",
+                ?.takeIf { it == "linkkf" || it == "kairan" || it == "csora" } ?: "linkkf",
             customFontPath = prefs.getString("pref_custom_font_path", null),
-            showAniSkipButton = prefs.getBoolean("pref_show_ani_skip_button", true)
+            showAniSkipButton = prefs.getBoolean("pref_show_ani_skip_button", true),
+            doubleTapSeekSeconds = prefs.getInt("pref_double_tap_seek_seconds", 10).coerceIn(1, 120)
         )
     }
 
