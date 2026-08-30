@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.net.ConnectivityManager
@@ -22,6 +23,9 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebChromeClient
+import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -34,6 +38,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -59,6 +64,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -68,6 +74,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -109,6 +117,7 @@ import io.github.peerless2012.ass.media.parser.AssSubtitleParserFactory
 import io.github.peerless2012.ass.media.type.AssRenderType
 import io.github.peerless2012.ass.media.widget.AssSubtitleView
 import com.lilac.anime.data.*
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -121,20 +130,128 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.zip.ZipInputStream
+import java.net.URLConnection
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
 import android.content.Intent
+import android.provider.Settings
 import kotlinx.coroutines.flow.update
 
 // ============================================================
 // DATA MODELS
 // ============================================================
+
+
+private data class GithubReleaseInfo(
+    val tag: String,
+    val name: String,
+    val releaseUrl: String,
+    val apkUrl: String?,
+    val body: String
+)
+
+private object GithubReleaseChecker {
+    private const val REPOSITORY = "dream150/LilacAnime"
+    private const val PREF_LAST_NOTIFIED_TAG = "github_last_notified_release_tag"
+    private const val CHANNEL_ID = "github_release_updates"
+    private const val NOTIFICATION_ID = 7401
+
+    suspend fun check(context: Context): GithubReleaseInfo? = withContext(Dispatchers.IO) {
+        if (REPOSITORY == "OWNER/REPOSITORY") return@withContext null
+        try {
+            val connection = (URL("https://api.github.com/repos/$REPOSITORY/releases/latest").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"; connectTimeout = 10000; readTimeout = 10000; useCaches = false
+                setRequestProperty("Accept", "application/vnd.github+json")
+                setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+                setRequestProperty("User-Agent", "LilacAnime")
+            }
+            try {
+                val code = connection.responseCode
+                val body = (if (code in 200..299) connection.inputStream else connection.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+                if (code !in 200..299 || body.isBlank()) return@withContext null
+                val json = JSONObject(body)
+                val tag = json.optString("tag_name").trim()
+                val name = json.optString("name").trim().ifBlank { tag }
+                val releaseUrl = json.optString("html_url").trim()
+                val releaseBody = json.optString("body").trim()
+                if (tag.isBlank()) return@withContext null
+                var apkUrl: String? = null
+                json.optJSONArray("assets")?.let { assets ->
+                    for (i in 0 until assets.length()) {
+                        val asset = assets.optJSONObject(i) ?: continue
+                        if (asset.optString("name").lowercase(Locale.ROOT).endsWith(".apk")) {
+                            apkUrl = asset.optString("browser_download_url").trim().takeIf { it.isNotBlank() }
+                            if (apkUrl != null) break
+                        }
+                    }
+                }
+                val prefs = context.getSharedPreferences("lilac_offline_store", Context.MODE_PRIVATE)
+                val previous = prefs.getString(PREF_LAST_NOTIFIED_TAG, null)
+                if (previous == null) { prefs.edit().putString(PREF_LAST_NOTIFIED_TAG, tag).apply(); return@withContext null }
+                if (previous == tag) return@withContext null
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    (context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager).createNotificationChannel(
+                        android.app.NotificationChannel(CHANNEL_ID, "GitHub 업데이트", android.app.NotificationManager.IMPORTANCE_DEFAULT)
+                    )
+                }
+                val canNotify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                if (canNotify) {
+                    val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+                        .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                        .setContentTitle("새 GitHub 릴리스가 있습니다")
+                        .setContentText(name)
+                        .setStyle(NotificationCompat.BigTextStyle().bigText("새 릴리스 $tag 를 사용할 수 있습니다."))
+                        .setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                    if (releaseUrl.isNotBlank()) {
+                        val flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) android.app.PendingIntent.FLAG_IMMUTABLE else 0
+                        builder.setContentIntent(android.app.PendingIntent.getActivity(context, NOTIFICATION_ID, Intent(Intent.ACTION_VIEW, Uri.parse(releaseUrl)), flags))
+                    }
+                    NotificationManagerCompat.from(context).notify(NOTIFICATION_ID, builder.build())
+                }
+                prefs.edit().putString(PREF_LAST_NOTIFIED_TAG, tag).apply()
+                GithubReleaseInfo(tag, name, releaseUrl, apkUrl, releaseBody)
+            } finally { connection.disconnect() }
+        } catch (e: Exception) { Log.w("GithubRelease", "CHECK_FAILED", e); null }
+    }
+
+    suspend fun downloadApk(context: Context, apkUrl: String): File = withContext(Dispatchers.IO) {
+        val file = File(context.cacheDir, "lilac_update.apk")
+        val connection = (URL(apkUrl).openConnection() as HttpURLConnection).apply { connectTimeout = 15000; readTimeout = 30000; requestMethod = "GET"; setRequestProperty("User-Agent", "LilacAnime"); instanceFollowRedirects = true }
+        try {
+            if (connection.responseCode !in 200..299) throw IllegalStateException("APK 다운로드 실패: HTTP ${connection.responseCode}")
+            connection.inputStream.use { input -> FileOutputStream(file).use { output -> input.copyTo(output) } }
+            file
+        } finally { connection.disconnect() }
+    }
+}
+
+private suspend fun installApkWithPackageInstaller(context: Context, apkFile: File) = withContext(Dispatchers.IO) {
+    val installer = context.packageManager.packageInstaller
+    val params = android.content.pm.PackageInstaller.SessionParams(android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+    params.setSize(apkFile.length())
+    val sessionId = installer.createSession(params)
+    val session = installer.openSession(sessionId)
+    try {
+        apkFile.inputStream().use { input -> session.openWrite("base.apk", 0, apkFile.length()).use { output -> input.copyTo(output); session.fsync(output) } }
+        val intent = Intent(context, MainActivity::class.java).apply { action = "com.lilac.anime.UPDATE_RESULT"; addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP) }
+        val flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) android.app.PendingIntent.FLAG_IMMUTABLE else 0
+        val pending = android.app.PendingIntent.getActivity(context, sessionId, intent, flags)
+        session.commit(pending.intentSender)
+    } catch (e: Exception) { session.abandon(); throw e } finally { session.close() }
+}
+
 
 data class StreamQuality(
     val label: String,
@@ -149,7 +266,12 @@ data class PlayerSettings(
     val backgroundColor: Int = android.graphics.Color.TRANSPARENT,
     val strokeColor: Int = android.graphics.Color.BLACK,
     val syncOffsetMs: Long = 0L,
-    val customFontPath: String? = null
+    // Media3 SubtitleView 기준: 값이 클수록 VTT/SRT 자막이 화면 위쪽으로 올라간다.
+    val subtitleBottomPaddingFraction: Float = 0.12f,
+    // 자막 소스: "linkkf" = Linkkf VTT, "kairan" = Kairan ASS
+    val subtitleSourcePreference: String = "linkkf",
+    val customFontPath: String? = null,
+    val showAniSkipButton: Boolean = true
 )
 
 data class ExoVideoQualityOption(
@@ -819,6 +941,7 @@ object AniSkipService {
                         val combinedText = names.joinToString(" ")
 
                         val detectedSeason = extractSeasonNumber(combinedText)
+                        val anilistSeason = item.optString("season").trim()
                         val seasonYear = item.optInt("seasonYear", 0).takeIf { it > 0 }
                         val episodes = item.optInt("episodes", 0).takeIf { it > 0 }
 
@@ -1884,18 +2007,94 @@ object AniSkipService {
 // ============================================================
 
 class MainActivity : ComponentActivity() {
+    private var refreshInstallPermission: (() -> Unit)? = null
+
+    override fun onResume() {
+        super.onResume()
+        refreshInstallPermission?.invoke()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             val viewModel: AnimeViewModel = viewModel()
             val context = LocalContext.current
             
+            var pendingRelease by remember { mutableStateOf<GithubReleaseInfo?>(null) }
+            var updateBusy by remember { mutableStateOf(false) }
+            var updateError by remember { mutableStateOf<String?>(null) }
+            var installPermissionGranted by remember {
+                mutableStateOf(
+                    Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                        packageManager.canRequestPackageInstalls()
+                )
+            }
+            LaunchedEffect(Unit) {
+                refreshInstallPermission = {
+                    installPermissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                        packageManager.canRequestPackageInstalls()
+                }
+            }
+
             LaunchedEffect(Unit) {
                 viewModel.monitorNetwork(context)
                 viewModel.loadAnime(context)
+                val release = GithubReleaseChecker.check(context)
+                if (release != null) pendingRelease = release
             }
-            
+
             LilacApp(vm = viewModel)
+
+            pendingRelease?.let { release ->
+                AlertDialog(
+                    onDismissRequest = { if (!updateBusy) pendingRelease = null },
+                    title = { Text("새 버전이 있습니다") },
+                    text = {
+                        Column {
+                            Text("Lilac Anime ${release.tag}")
+                            if (release.name != release.tag) Text(release.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 6.dp))
+                            if (release.body.isNotBlank()) Text(release.body.take(700), fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
+                            if (updateBusy) Text("업데이트 파일을 다운로드하고 설치 준비 중입니다...", modifier = Modifier.padding(top = 12.dp), fontSize = 12.sp)
+                            updateError?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 8.dp), fontSize = 12.sp) }
+                        }
+                    },
+                    confirmButton = {
+                        if (release.apkUrl != null) {
+                            TextButton(enabled = !updateBusy, onClick = {
+                                updateError = null
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+                                    installPermissionGranted = false
+                                    try {
+                                        context.startActivity(Intent(
+                                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                            Uri.parse("package:$packageName")
+                                        ))
+                                    } catch (_: Exception) {
+                                        context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES))
+                                    }
+                                } else {
+                                    installPermissionGranted = true
+                                    updateBusy = true
+                                    CoroutineScope(Dispatchers.Main).launch {
+                                        try {
+                                            val apk = GithubReleaseChecker.downloadApk(context, release.apkUrl)
+                                            installApkWithPackageInstaller(context, apk)
+                                        } catch (e: Exception) {
+                                            updateError = "업데이트 설치를 시작하지 못했습니다: ${e.message ?: "알 수 없는 오류"}"
+                                            updateBusy = false
+                                        }
+                                    }
+                                }
+                            }) {
+                                Text(if (installPermissionGranted) "앱에서 설치" else "설치 권한 허용")
+                            }
+                        } else {
+                            TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.releaseUrl))); pendingRelease = null }) { Text("릴리스 페이지") }
+                        }
+                    },
+                    dismissButton = { TextButton(enabled = !updateBusy, onClick = { pendingRelease = null }) { Text("나중에") } }
+                )
+            }
         }
     }
 }
@@ -2130,8 +2329,15 @@ class AnimeViewModel : ViewModel() {
         }
     }
 
-    fun loadAnimeDetail(target: Anime) {
-        if (detailCache.containsKey(target.id)) return
+    fun loadAnimeDetail(
+        target: Anime,
+        force: Boolean = false,
+        onLoaded: ((Anime) -> Unit)? = null
+    ) {
+        if (!force && detailCache.containsKey(target.id)) {
+            detailCache[target.id]?.let { onLoaded?.invoke(it) }
+            return
+        }
 
         viewModelScope.launch {
             try {
@@ -2142,7 +2348,10 @@ class AnimeViewModel : ViewModel() {
                 animeCache[result.id] = result
                 homeAnime = homeAnime.map { if (it.id == result.id) result else it }
                 allAnime = allAnime.map { if (it.id == result.id) result else it }
-            } catch (_: Exception) {}
+                onLoaded?.invoke(result)
+            } catch (e: Exception) {
+                Log.w("AnimeDetail", "DETAIL_REFRESH_FAILED id=${target.id}", e)
+            }
         }
     }
 
@@ -2193,7 +2402,11 @@ class AnimeViewModel : ViewModel() {
         return episodeLoading[anime.id] == true
     }
 
-    fun loadEpisodes(context: Context, anime: Anime) {
+    fun loadEpisodes(
+        context: Context,
+        anime: Anime,
+        force: Boolean = false
+    ) {
         val currentList = episodeCache[anime.id]
         val isOfflineOnly = isOfflineOnlyCache[anime.id] ?: false
 
@@ -2202,7 +2415,7 @@ class AnimeViewModel : ViewModel() {
             return
         }
 
-        if (!currentList.isNullOrEmpty() && !isOfflineOnly) {
+        if (!force && !currentList.isNullOrEmpty() && !isOfflineOnly) {
             return
         }
 
@@ -3223,6 +3436,26 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(16.dp))
 
+            Text(
+                "기본 VTT 자막 위치 (${(settings.subtitleBottomPaddingFraction * 100).toInt()}%)",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            Slider(
+                value = settings.subtitleBottomPaddingFraction,
+                onValueChange = {
+                    vm.updatePlayerSettings(
+                        context,
+                        settings.copy(subtitleBottomPaddingFraction = it)
+                    )
+                },
+                valueRange = 0.03f..0.30f,
+                steps = 26
+            )
+
+            Spacer(Modifier.height(16.dp))
+
             Text("자막 싱크 미세 조정 (${settings.syncOffsetMs} ms)", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onBackground)
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -3265,7 +3498,12 @@ fun SettingsScreen(
             Spacer(Modifier.height(20.dp))
 
             Text("Lilac Anime", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
-            Text("Version 0.1.0", color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
+            val appVersion = context.packageManager
+                .getPackageInfo(context.packageName, 0)
+                .versionName
+                .orEmpty()
+                .ifBlank { "Unknown" }
+            Text("Version $appVersion", color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
         }
     }
 }
@@ -3305,15 +3543,21 @@ fun DetailScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val isOffline by vm.isOffline.collectAsState()
+    var detailAnime by remember(anime.id) { mutableStateOf(anime) }
 
     LaunchedEffect(anime.id, isOffline) {
-        vm.loadAnimeDetail(anime)
-        vm.loadEpisodes(context, anime)
+        vm.loadAnimeDetail(
+            target = detailAnime,
+            force = !isOffline,
+            onLoaded = { refreshed -> detailAnime = refreshed }
+        )
+        vm.loadEpisodes(context, detailAnime, force = !isOffline)
     }
 
-    val saved = vm.isInLibrary(anime.id)
-    val episodes = vm.episodes(anime)
-    val episodesLoading = vm.isEpisodesLoading(anime)
+    val currentAnime = detailAnime
+    val saved = vm.isInLibrary(currentAnime.id)
+    val episodes = vm.episodes(currentAnime)
+    val episodesLoading = vm.isEpisodesLoading(currentAnime)
 
     val downloadProgressMap by vm.downloadProgressMap.collectAsState()
 
@@ -3339,6 +3583,77 @@ fun DetailScreen(
         activeExtractEpisode = null
         currentExtractDeferred = null
         return result
+    }
+
+    // 이미 영상이 다운로드된 에피소드에도 Linkkf VTT와 Kairan ASS를 모두 보충한다.
+    suspend fun repairDownloadedSubtitles(ep: Episode) {
+        if (!vm.isEpisodeDownloaded(currentAnime.id, ep.number)) return
+
+        val stored = OfflineStore.getEpisode(context, currentAnime.id, ep.number)
+        val legacyPath = stored?.vttUrl
+        val linkkfReady = withContext(Dispatchers.IO) {
+            SubtitleStore.get(context, currentAnime.id, ep.number, "linkkf")
+        } ?: legacyPath?.takeIf { File(it).isFile && (it.endsWith(".vtt", true) || it.endsWith(".srt", true)) }
+        val kairanReady = withContext(Dispatchers.IO) {
+            SubtitleStore.get(context, currentAnime.id, ep.number, "kairan")
+        } ?: findLocalKairanAssSubtitle(context, currentAnime.title, ep.number, legacyPath)
+
+        if (linkkfReady != null && kairanReady != null) return
+
+        Log.d(
+            "Subtitle",
+            "REPAIR_BOTH_START anime=${currentAnime.id} episode=${ep.number} " +
+                "linkkf=${linkkfReady != null} kairan=${kairanReady != null}"
+        )
+
+        try {
+            var linkkfPath = linkkfReady
+            if (linkkfPath == null) {
+                val (_, extractedVtt) = extractEpisodeInfo(ep)
+                if (!extractedVtt.isNullOrBlank()) {
+                    linkkfPath = downloadSubtitleFile(
+                        context = context,
+                        animeId = currentAnime.id,
+                        episodeNumber = ep.number,
+                        vttUrl = extractedVtt
+                    )
+                }
+            }
+
+            var kairanPath = kairanReady
+            if (kairanPath == null) {
+                kairanPath = try {
+                    when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
+                        is KairanSubtitleResult.DirectFile -> result.path
+                        null -> null
+                    }
+                } catch (e: Exception) {
+                    Log.w("Kairan", "OFFLINE_ASS_REPAIR_FAILED episode=${ep.number}", e)
+                    null
+                }
+            }
+
+            SubtitleStore.save(context, currentAnime.id, ep.number, "linkkf", linkkfPath)
+            SubtitleStore.save(context, currentAnime.id, ep.number, "kairan", kairanPath)
+
+            if (linkkfPath != null || kairanPath != null) {
+                val currentStored = OfflineStore.getEpisode(context, currentAnime.id, ep.number)
+                OfflineStore.saveEpisode(
+                    context,
+                    currentAnime.id,
+                    (currentStored ?: ep).copy(
+                        videoUrl = currentStored?.videoUrl ?: ep.videoUrl,
+                        vttUrl = linkkfPath ?: kairanPath ?: currentStored?.vttUrl ?: ep.vttUrl
+                    )
+                )
+            }
+            Log.d(
+                "Subtitle",
+                "REPAIR_BOTH_DONE episode=${ep.number} linkkf=${linkkfPath != null} kairan=${kairanPath != null}"
+            )
+        } catch (e: Exception) {
+            Log.e("Subtitle", "REPAIR_BOTH_FAILED episode=${ep.number}", e)
+        }
     }
 
     // 화질 선택 대기용 Deferred 및 Dialog 상태 관리
@@ -3378,10 +3693,12 @@ fun DetailScreen(
                 }
 
                 withContext(Dispatchers.IO) {
-                    // 오프라인 재생에서도 원본 ASS 스타일을 유지할 수 있도록
-                    // 다운로드 시 Kairan ASS를 먼저 찾아 앱 내부 영구 저장소에 보관한다.
-                    val kairanSubtitlePath = try {
-                        when (val result = KairanSubtitleService.findSubtitle(context, anime.title, ep.number)) {
+                    // 오프라인 저장 시 Linkkf VTT와 Kairan ASS를 모두 저장한다.
+                    val localLinkkfPath = downloadSubtitleFile(
+                        context, currentAnime.id, ep.number, vttUrl
+                    )
+                    val localKairanPath = try {
+                        when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
                             is KairanSubtitleResult.DirectFile -> result.path
                             null -> null
                         }
@@ -3389,22 +3706,18 @@ fun DetailScreen(
                         Log.w("Kairan", "OFFLINE_ASS_PRELOAD_FAILED episode=${ep.number}", e)
                         null
                     }
+                    SubtitleStore.save(context, currentAnime.id, ep.number, "linkkf", localLinkkfPath)
+                    SubtitleStore.save(context, currentAnime.id, ep.number, "kairan", localKairanPath)
 
-                    val localVttPath = if (kairanSubtitlePath == null) {
-                        downloadSubtitleFile(context, anime.id, ep.number, vttUrl)
-                    } else {
-                        null
-                    }
-
-                    startEpisodeDownload(context, anime.id, anime.title, ep, selectedQuality.url)
+                    startEpisodeDownload(context, currentAnime.id, currentAnime.title, ep, selectedQuality.url)
 
                     OfflineStore.saveAnime(context, anime)
                     OfflineStore.saveEpisode(
                         context = context,
-                        animeId = anime.id,
+                        animeId = currentAnime.id,
                         episode = ep.copy(
                             videoUrl = selectedQuality.url,
-                            vttUrl = kairanSubtitlePath ?: localVttPath ?: vttUrl
+                            vttUrl = localLinkkfPath ?: localKairanPath ?: vttUrl
                         )
                     )
                 }
@@ -3437,9 +3750,12 @@ fun DetailScreen(
                         }
 
                         withContext(Dispatchers.IO) {
-                            // 배치 다운로드도 동일하게 Kairan ASS를 우선 저장한다.
-                            val kairanSubtitlePath = try {
-                                when (val result = KairanSubtitleService.findSubtitle(context, anime.title, ep.number)) {
+                            // 오프라인 저장 시 Linkkf VTT와 Kairan ASS를 모두 저장한다.
+                            val localLinkkfPath = downloadSubtitleFile(
+                                context, currentAnime.id, ep.number, vttUrl
+                            )
+                            val localKairanPath = try {
+                                when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
                                     is KairanSubtitleResult.DirectFile -> result.path
                                     null -> null
                                 }
@@ -3447,22 +3763,18 @@ fun DetailScreen(
                                 Log.w("Kairan", "OFFLINE_ASS_PRELOAD_FAILED episode=${ep.number}", e)
                                 null
                             }
+                            SubtitleStore.save(context, currentAnime.id, ep.number, "linkkf", localLinkkfPath)
+                            SubtitleStore.save(context, currentAnime.id, ep.number, "kairan", localKairanPath)
 
-                            val localVttPath = if (kairanSubtitlePath == null) {
-                                downloadSubtitleFile(context, anime.id, ep.number, vttUrl)
-                            } else {
-                                null
-                            }
-
-                            startEpisodeDownload(context, anime.id, anime.title, ep, selectedQuality.url)
+                            startEpisodeDownload(context, currentAnime.id, currentAnime.title, ep, selectedQuality.url)
 
                             OfflineStore.saveAnime(context, anime)
                             OfflineStore.saveEpisode(
                                 context = context,
-                                animeId = anime.id,
+                                animeId = currentAnime.id,
                                 episode = ep.copy(
                                     videoUrl = selectedQuality.url,
-                                    vttUrl = kairanSubtitlePath ?: localVttPath ?: vttUrl
+                                    vttUrl = localLinkkfPath ?: localKairanPath ?: vttUrl
                                 )
                             )
                         }
@@ -3476,13 +3788,32 @@ fun DetailScreen(
         }
     }
 
+    // 기존 오프라인 영상도 두 자막 소스를 모두 보충한다. 영상은 건드리지 않는다.
+    LaunchedEffect(currentAnime.id, episodes.size, isOffline) {
+        if (isOffline) return@LaunchedEffect
+
+        val downloadedEpisodes = episodes.filter {
+            vm.isEpisodeDownloaded(currentAnime.id, it.number)
+        }
+
+        for (ep in downloadedEpisodes) {
+            if (!isActive) break
+            repairDownloadedSubtitles(ep)
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        LazyColumn(Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .navigationBarsPadding(),
+            contentPadding = PaddingValues(bottom = 96.dp)
+        ) {
             item {
                 Box(Modifier.fillMaxWidth().height(280.dp)) {
                     AsyncImage(
-                        model = anime.backdrop,
-                        contentDescription = anime.title,
+                        model = currentAnime.backdrop,
+                        contentDescription = currentAnime.title,
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Crop
                     )
@@ -3497,19 +3828,19 @@ fun DetailScreen(
                 Column(Modifier.padding(20.dp)) {
                     Row {
                         AsyncImage(
-                            model = anime.poster,
-                            contentDescription = anime.title,
+                            model = currentAnime.poster,
+                            contentDescription = currentAnime.title,
                             modifier = Modifier.size(width = 110.dp, height = 160.dp).clip(RoundedCornerShape(16.dp)),
                             contentScale = ContentScale.Crop
                         )
                         Spacer(Modifier.width(16.dp))
                         Column {
-                            Text(anime.title, fontSize = 23.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+                            Text(currentAnime.title, fontSize = 23.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
                             Spacer(Modifier.height(8.dp))
                             Text("${episodes.size}화", color = LilacDark)
                             Spacer(Modifier.height(8.dp))
                             Text(
-                                anime.genres.joinToString(" · "),
+                                currentAnime.genres.joinToString(" · "),
                                 color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
                             )
                         }
@@ -3519,9 +3850,9 @@ fun DetailScreen(
 
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
-                            enabled = episodes.isNotEmpty() && (!isOffline || vm.isEpisodeDownloaded(anime.id, episodes.first().number)),
+                            enabled = episodes.isNotEmpty() && (!isOffline || vm.isEpisodeDownloaded(currentAnime.id, episodes.first().number)),
                             onClick = {
-                                val latestProgress = vm.getLatestProgress(anime.id)
+                                val latestProgress = vm.getLatestProgress(currentAnime.id)
                                 val episodeNumber = latestProgress?.episodeNumber ?: episodes.first().number
                                 val episode = episodes.firstOrNull { it.number == episodeNumber } ?: episodes.first()
                                 playEpisode(episode)
@@ -3533,7 +3864,7 @@ fun DetailScreen(
                             Text("재생", color = Color.White)
                         }
 
-                        OutlinedButton(onClick = { vm.toggleLibrary(context, anime.id) }) {
+                        OutlinedButton(onClick = { vm.toggleLibrary(context, currentAnime.id) }) {
                             Icon(if (saved) Icons.Default.Favorite else Icons.Default.FavoriteBorder, contentDescription = null, tint = MaterialTheme.colorScheme.onBackground)
                             Spacer(Modifier.width(5.dp))
                             Text(if (saved) "저장됨" else "내 목록", color = MaterialTheme.colorScheme.onBackground)
@@ -3549,7 +3880,7 @@ fun DetailScreen(
                                         currentExtractDeferred?.cancel()
                                         Toast.makeText(context, "전체 다운로드가 중단되었습니다.", Toast.LENGTH_SHORT).show()
                                     } else {
-                                        val notDownloaded = episodes.filter { !vm.isEpisodeDownloaded(anime.id, it.number) }
+                                        val notDownloaded = episodes.filter { !vm.isEpisodeDownloaded(currentAnime.id, it.number) }
                                         if (notDownloaded.isNotEmpty()) {
                                             processBatchDownload(notDownloaded)
                                         } else {
@@ -3573,7 +3904,7 @@ fun DetailScreen(
                     }
 
                     Spacer(Modifier.height(18.dp))
-                    Text(anime.description, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f))
+                    Text(currentAnime.description, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f))
                 }
             }
 
@@ -3595,10 +3926,10 @@ fun DetailScreen(
                 }
 
                 items(episodes) { ep ->
-                    val downloadKey = "${anime.id}_${ep.number}"
-                    val isDownloaded = vm.isEpisodeDownloaded(anime.id, ep.number)
+                    val downloadKey = "${currentAnime.id}_${ep.number}"
+                    val isDownloaded = vm.isEpisodeDownloaded(currentAnime.id, ep.number)
                     val downloadingProgress = downloadProgressMap[downloadKey]
-                    val epProgress = vm.getProgress(anime.id, ep.number)
+                    val epProgress = vm.getProgress(currentAnime.id, ep.number)
 
                     Row(
                         modifier = Modifier
@@ -3658,7 +3989,7 @@ fun DetailScreen(
                                     modifier = Modifier
                                         .size(36.dp)
                                         .clickable {
-                                            vm.cancelDownload(context, anime.id, ep.number)
+                                            vm.cancelDownload(context, currentAnime.id, ep.number)
                                             Toast.makeText(context, "${ep.number}화 다운로드가 취소되었습니다.", Toast.LENGTH_SHORT).show()
                                         }
                                 ) {
@@ -3831,6 +4162,7 @@ fun PlayerScreen(
     
     var currentEpisode by remember(episode) { mutableStateOf(episode) }
     
+    var isFullScreen by remember { mutableStateOf(false) }
     var streamUrl by remember { mutableStateOf<String?>(null) }
     var subtitlesUrl by remember { mutableStateOf<String?>(null) }
     var subtitleSource by remember { mutableStateOf("none") }
@@ -3840,16 +4172,29 @@ fun PlayerScreen(
     var isAutoPlayEnabled by rememberSaveable { mutableStateOf(true) }
     var isAutoSkipEnabled by rememberSaveable { mutableStateOf(true) }
     var isControlsVisible by remember { mutableStateOf(true) }
+    var isPlayerLocked by rememberSaveable { mutableStateOf(false) }
+    var showLockedButton by remember { mutableStateOf(false) }
+    var lockedButtonRequest by remember { mutableIntStateOf(0) }
     var aniSkipSegments by remember { mutableStateOf<List<AniSkipSegment>>(emptyList()) }
     var activeAniSkipSegment by remember { mutableStateOf<AniSkipSegment?>(null) }
     var buttonAniSkipSegment by remember { mutableStateOf<AniSkipSegment?>(null) }
     var aniSkipEnteredAtMs by remember { mutableLongStateOf(-1L) }
     var skippedAniSkipKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var skipEpisodeKey by remember { mutableStateOf<String?>(null) }
     var suppressProgressSaveForEpisode by remember { mutableStateOf<Int?>(null) }
 
     var subtitleSizePercent by rememberSaveable { mutableFloatStateOf(vm.playerSettings.subtitleSize) }
     var subtitleSizeText by rememberSaveable { mutableStateOf(vm.playerSettings.subtitleSize.toInt().toString()) }
     var syncOffsetMs by rememberSaveable { mutableLongStateOf(vm.playerSettings.syncOffsetMs) }
+    var subtitleBottomPaddingFraction by rememberSaveable {
+        mutableFloatStateOf(vm.playerSettings.subtitleBottomPaddingFraction)
+    }
+    var subtitleSourcePreference by rememberSaveable {
+        mutableStateOf(vm.playerSettings.subtitleSourcePreference)
+    }
+    var syncOffsetText by rememberSaveable {
+        mutableStateOf(vm.playerSettings.syncOffsetMs.toString())
+    }
     var isVttStyleEnabled by rememberSaveable { mutableStateOf(true) }
     var customTypeface by remember { mutableStateOf<Typeface?>(null) }
     var customFontName by remember { mutableStateOf<String?>(null) }
@@ -3970,23 +4315,27 @@ fun PlayerScreen(
         offlineEp = OfflineStore.getEpisode(context, anime.id, currentEpisode.number)
     }
 
-    // 플레이어에서는 상태 표시줄/내비게이션 바를 항상 숨긴다.
-    // 플레이어를 벗어나면 원래 상태로 복원한다.
-    DisposableEffect(activity) {
-        val window = activity?.window
-        val controller = window?.let {
-            WindowCompat.getInsetsController(it, it.decorView)
-        }
-        controller?.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        controller?.hide(WindowInsetsCompat.Type.systemBars())
-
-        onDispose {
-            controller?.show(WindowInsetsCompat.Type.systemBars())
+    LaunchedEffect(isFullScreen) {
+        activity?.window?.let { window ->
+            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+            if (isFullScreen) {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                insetsController.hide(WindowInsetsCompat.Type.systemBars())
+                insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            } else {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                insetsController.show(WindowInsetsCompat.Type.systemBars())
+            }
         }
     }
 
-    BackHandler { back() }
+    BackHandler {
+        if (isFullScreen) {
+            isFullScreen = false
+        } else {
+            back()
+        }
+    }
 
     // Restore a user-imported subtitle saved in OfflineStore even when the
     // current episode itself is not downloaded. This makes the custom subtitle
@@ -4020,6 +4369,7 @@ fun PlayerScreen(
         buttonAniSkipSegment = null
         aniSkipEnteredAtMs = -1L
         skippedAniSkipKeys = emptySet()
+        skipEpisodeKey = null
         suppressProgressSaveForEpisode = null
         
         val targetUrl = if (isDownloaded) {
@@ -4035,31 +4385,23 @@ fun PlayerScreen(
                 streamUrl = targetUrl
 
                 val storedSubtitle = offlineEp?.vttUrl ?: currentEpisode.vttUrl
-                val localStoredSubtitle = storedSubtitle?.takeIf { path ->
-                    path.startsWith("/") && File(path).isFile
-                }
+                val localStoredSubtitle = storedSubtitle?.takeIf { path -> path.startsWith("/") && File(path).isFile }
                 val localUserSubtitle = localStoredSubtitle?.takeIf { isLocalUserSubtitlePath(it) }
-
-                // User-imported subtitles always have the highest priority.
-                // This prevents Kairan from replacing a subtitle the user explicitly selected.
-                val localAssSubtitle = if (localUserSubtitle == null) {
-                    findLocalKairanAssSubtitle(
-                        context = context,
-                        title = anime.title,
-                        episodeNumber = currentEpisode.number,
-                        storedPath = localStoredSubtitle
-                    )
-                } else null
-
+                val localLinkkf = withContext(Dispatchers.IO) {
+                    SubtitleStore.get(context, anime.id, currentEpisode.number, "linkkf")
+                } ?: localStoredSubtitle?.takeIf { it.endsWith(".vtt", true) || it.endsWith(".srt", true) }
+                val localKairan = withContext(Dispatchers.IO) {
+                    SubtitleStore.get(context, anime.id, currentEpisode.number, "kairan")
+                } ?: findLocalKairanAssSubtitle(context, anime.title, currentEpisode.number, localStoredSubtitle)
                 subtitlesUrl = when {
                     localUserSubtitle != null -> localUserSubtitle
-                    localAssSubtitle != null -> localAssSubtitle
-                    isDownloaded || isOffline -> localStoredSubtitle
-                    else -> storedSubtitle
+                    subtitleSourcePreference == "kairan" -> localKairan ?: localLinkkf
+                    else -> localLinkkf ?: localKairan
                 }
                 subtitleSource = when {
                     localUserSubtitle != null -> "user"
-                    subtitlesUrl != null -> "offline"
+                    subtitlesUrl == localKairan && localKairan != null -> "kairan"
+                    subtitlesUrl != null -> "linkkf-vtt"
                     else -> "none"
                 }
                 kairanSubtitleResolved = true
@@ -4070,10 +4412,9 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(anime.id, anime.title, currentEpisode.number, isOffline, isDownloaded, currentEpisode.vttUrl) {
+    LaunchedEffect(anime.id, anime.title, currentEpisode.number, isOffline, isDownloaded, currentEpisode.vttUrl, subtitleSourcePreference) {
         kairanSubtitleResolved = false
 
-        // A user-imported subtitle always wins over Kairan and streaming fallback.
         val userSubtitle = currentEpisode.vttUrl?.takeIf { isLocalUserSubtitlePath(it) }
         if (userSubtitle != null) {
             subtitlesUrl = userSubtitle
@@ -4083,42 +4424,41 @@ fun PlayerScreen(
             return@LaunchedEffect
         }
 
-        // First, prefer any ASS that is already stored locally. This also fixes
-        // older downloaded episodes whose OfflineStore entry still points at VTT.
-        val existingAss = withContext(Dispatchers.IO) {
-            findLocalKairanAssSubtitle(
-                context = context,
-                title = anime.title,
-                episodeNumber = currentEpisode.number,
-                storedPath = subtitlesUrl
-            )
-        }
+        val storedSubtitle = offlineEp?.vttUrl ?: currentEpisode.vttUrl
+        val localStoredSubtitle = storedSubtitle?.takeIf { path -> path.startsWith("/") && File(path).isFile }
 
-        if (existingAss != null) {
-            subtitlesUrl = existingAss
-            subtitleSource = "kairan"
-            Log.d("Kairan", "PREFER_LOCAL_ASS path=$existingAss episode=${currentEpisode.number}")
-
-            if (isDownloaded) {
-                OfflineStore.saveEpisode(
-                    context = context,
-                    animeId = anime.id,
-                    episode = (offlineEp ?: currentEpisode).copy(vttUrl = existingAss)
-                )
+        if (isOffline || isDownloaded) {
+            val localLinkkf = withContext(Dispatchers.IO) {
+                SubtitleStore.get(context, anime.id, currentEpisode.number, "linkkf")
+            } ?: localStoredSubtitle?.takeIf {
+                it.endsWith(".vtt", true) || it.endsWith(".srt", true) || it.contains("/sub_${anime.id}_${currentEpisode.number}.")
+            }
+            val localKairan = withContext(Dispatchers.IO) {
+                SubtitleStore.get(context, anime.id, currentEpisode.number, "kairan")
+            } ?: findLocalKairanAssSubtitle(context, anime.title, currentEpisode.number, localStoredSubtitle)
+            when (subtitleSourcePreference) {
+                "kairan" -> {
+                    subtitlesUrl = localKairan ?: localLinkkf
+                    subtitleSource = if (localKairan != null) "kairan" else if (localLinkkf != null) "linkkf-vtt" else "none"
+                }
+                else -> {
+                    subtitlesUrl = localLinkkf ?: localKairan
+                    subtitleSource = if (localLinkkf != null) "linkkf-vtt" else if (localKairan != null) "kairan" else "none"
+                }
             }
             kairanSubtitleResolved = true
             return@LaunchedEffect
         }
 
-        // A downloaded episode can be upgraded to ASS automatically when the
-        // device is online. The video itself is never downloaded again.
-        if (!isOffline) {
-            val result: KairanSubtitleResult? = try {
+        // 스트리밍에서는 선택한 소스를 사용한다. Kairan은 필요할 때 캐시하고,
+        // Linkkf는 StreamUrlExtractor가 발견한 VTT 주소를 사용한다.
+        if (subtitleSourcePreference == "kairan") {
+            val result = try {
                 withContext(Dispatchers.IO) {
                     KairanSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
                 }
             } catch (e: Exception) {
-                Log.w("Kairan", "AUTO_ASS_SEARCH_FAILED episode=${currentEpisode.number}", e)
+                Log.w("Kairan", "SUBTITLE_SEARCH_FAILED episode=${currentEpisode.number}", e)
                 null
             }
 
@@ -4126,38 +4466,18 @@ fun PlayerScreen(
                 is KairanSubtitleResult.DirectFile -> {
                     subtitlesUrl = result.path
                     subtitleSource = "kairan"
-                    Log.d("Kairan", "PREFER_KAIRAN_ASS path=${result.path} episode=${currentEpisode.number}")
-
-                    if (isDownloaded) {
-                        OfflineStore.saveEpisode(
-                            context = context,
-                            animeId = anime.id,
-                            episode = (offlineEp ?: currentEpisode).copy(vttUrl = result.path)
-                        )
-                    }
+                    Log.d("Kairan", "USE_KAIRAN path=${result.path} episode=${currentEpisode.number}")
                 }
                 null -> {
-                    // Kairan ASS가 없거나 검색에 실패하면 기존 VTT/SRT 자막으로
-                    // 반드시 되돌아간다. Kairan 검색 때문에 원래 있던 자막이
-                    // 사라지지 않도록 현재/오프라인 저장 자막을 그대로 유지한다.
-                    val fallbackSubtitle = currentEpisode.vttUrl
-                        ?: offlineEp?.vttUrl
-                        ?: subtitlesUrl
-
-                    subtitlesUrl = fallbackSubtitle
-                    subtitleSource = when {
-                        fallbackSubtitle.isNullOrBlank() -> "none"
-                        isLocalUserSubtitlePath(fallbackSubtitle) -> "user"
-                        else -> "vtt"
-                    }
-                    Log.w(
-                        "Kairan",
-                        "ASS_NOT_FOUND episode=${currentEpisode.number}; FALLBACK_VTT path=$fallbackSubtitle"
-                    )
+                    subtitlesUrl = null
+                    subtitleSource = "none"
+                    Log.d("Kairan", "NO_KAIRAN_SUBTITLE episode=${currentEpisode.number}; waiting for Linkkf VTT fallback")
                 }
             }
         } else {
-            Log.d("Kairan", "OFFLINE_ASS_NOT_FOUND episode=${currentEpisode.number}; keeping existing local subtitle")
+            val linkkf = currentEpisode.vttUrl
+            subtitlesUrl = linkkf
+            subtitleSource = if (!linkkf.isNullOrBlank()) "linkkf-vtt" else "none"
         }
 
         kairanSubtitleResolved = true
@@ -4327,6 +4647,12 @@ fun PlayerScreen(
             val localDataSourceFactory = DefaultDataSource.Factory(context)
             DefaultMediaSourceFactory(context).setDataSourceFactory(localDataSourceFactory)
         } else {
+            val parsedUri = Uri.parse(url)
+            val refererHost = if (!parsedUri.host.isNullOrEmpty()) {
+                "${parsedUri.scheme ?: "https"}://${parsedUri.host}/"
+            } else {
+                "https://linkkf.tv/"
+            }
             val upstreamFactory = if (isOffline) {
                 null
             } else {
@@ -4368,32 +4694,59 @@ fun PlayerScreen(
 
         if (!subtitlesUrl.isNullOrEmpty()) {
             val subPath = subtitlesUrl!!
-            val subUri = when {
-                subPath.startsWith("http://") || subPath.startsWith("https://") -> Uri.parse(subPath)
-                subPath.startsWith("file://") -> Uri.parse(subPath)
-                else -> Uri.fromFile(File(subPath))
-            }
             val lowerSubPath = subPath.lowercase(Locale.ROOT)
             val subtitleMimeType = when {
                 lowerSubPath.contains(".ass") || lowerSubPath.contains(".ssa") -> MimeTypes.TEXT_SSA
                 lowerSubPath.contains(".srt") -> MimeTypes.APPLICATION_SUBRIP
                 else -> MimeTypes.TEXT_VTT
             }
-            Log.d("Subtitle", "LOAD source=$subtitleSource path=$subPath mime=$subtitleMimeType")
+
+            val effectiveSubtitlePath = if (
+                syncOffsetMs != 0L &&
+                subtitleMimeType != MimeTypes.TEXT_SSA
+            ) {
+                withContext(Dispatchers.IO) {
+                    prepareSyncedSubtitleFile(
+                        context = context,
+                        subtitlePath = subPath,
+                        animeId = anime.id,
+                        episodeNumber = currentEpisode.number,
+                        offsetMs = syncOffsetMs
+                    )
+                } ?: subPath
+            } else subPath
+
+            val subUri = when {
+                effectiveSubtitlePath.startsWith("http://") || effectiveSubtitlePath.startsWith("https://") ->
+                    Uri.parse(effectiveSubtitlePath)
+                effectiveSubtitlePath.startsWith("file://") ->
+                    Uri.parse(effectiveSubtitlePath)
+                else -> Uri.fromFile(File(effectiveSubtitlePath))
+            }
+
+            Log.d(
+                "Subtitle",
+                "LOAD source=$subtitleSource path=$subPath effective=$effectiveSubtitlePath " +
+                    "mime=$subtitleMimeType syncOffsetMs=$syncOffsetMs"
+            )
+
             val subtitleId = if (subtitleMimeType == MimeTypes.TEXT_SSA) {
-                // libass-android uses the external track id to bind the ASS
-                // stream to AssHandler. Keep it stable and well above the
-                // media track ids used by ExoPlayer.
                 "kairan-ass-${anime.id}-${currentEpisode.number}"
             } else {
-                "kairan-subtitle-${anime.id}-${currentEpisode.number}"
+                "${subtitleSource}-subtitle-${anime.id}-${currentEpisode.number}-${syncOffsetMs}"
             }
 
             val subtitleConfig = MediaItem.SubtitleConfiguration.Builder(subUri)
                 .setId(subtitleId)
                 .setMimeType(subtitleMimeType)
                 .setLanguage("ko")
-                .setLabel(if (subtitleMimeType == MimeTypes.TEXT_SSA) "Kairan ASS" else "Kairan Subtitle")
+                .setLabel(
+                    when {
+                        subtitleSource == "kairan" -> "Kairan ASS"
+                        subtitleSource == "linkkf-vtt" -> "Linkkf VTT"
+                        else -> "Subtitle"
+                    }
+                )
                 .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
                 .build()
             mediaItemBuilder.setSubtitleConfigurations(listOf(subtitleConfig))
@@ -4429,7 +4782,7 @@ fun PlayerScreen(
     }
 
     LaunchedEffect(streamUrl, currentEpisode.number) {
-        if (streamUrl == null) return@LaunchedEffect
+        val currentStreamUrl = streamUrl ?: return@LaunchedEffect
 
         aniSkipSegments = emptyList()
         activeAniSkipSegment = null
@@ -4512,6 +4865,8 @@ fun PlayerScreen(
                         endTime = safeEnd
                     )
                 }
+
+                skipEpisodeKey = "${anime.id}_${currentEpisode.number}"
 
                 Log.d(
                     "AniSkip",
@@ -4614,7 +4969,15 @@ fun PlayerScreen(
 
         val calculatedSp = 18f * (subtitleSizePercent / 100f)
         subView.setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, calculatedSp)
-        subView.setBottomPaddingFraction(0.09f)
+        val positionFraction = subtitleBottomPaddingFraction.coerceIn(0.03f, 0.45f)
+        subView.setBottomPaddingFraction(positionFraction)
+
+        // Media3 버전에 따라 bottomPaddingFraction이 재측정 시 되돌아가는 경우가 있어
+        // 실제 padding도 함께 갱신하고 즉시 invalidate/requestLayout 한다.
+        val bottomPx = (subView.height.coerceAtLeast(1) * positionFraction).toInt()
+        subView.setPadding(subView.paddingLeft, subView.paddingTop, subView.paddingRight, bottomPx)
+        subView.requestLayout()
+        subView.invalidate()
 
         val transparentStyle = CaptionStyleCompat(
             vm.playerSettings.textColor,
@@ -4641,7 +5004,7 @@ fun PlayerScreen(
                     factory = { ctx ->
                         PlayerView(ctx).apply {
                             player = forwardingPlayer
-                            useController = true
+                            useController = !isPlayerLocked
                             controllerShowTimeoutMs = 2000
                             setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
                                 isControlsVisible = (visibility == View.VISIBLE)
@@ -4667,7 +5030,10 @@ fun PlayerScreen(
                         }
                     },
                     update = { playerView ->
-                        playerView.player = forwardingPlayer
+                    val settingsButton = playerView.findViewById<View>(androidx.media3.ui.R.id.exo_settings)
+                    settingsButton?.visibility = View.GONE
+                    playerView.player = forwardingPlayer
+                    playerView.useController = !isPlayerLocked
                         applySubtitleSettingsToView(playerView)
                     },
                     modifier = Modifier.fillMaxSize()
@@ -4677,13 +5043,10 @@ fun PlayerScreen(
                 StreamUrlExtractor(
                     targetUrl = videoUrl,
                     onSubtitleFound = {
-                        if ((subtitleSource == "none" || subtitleSource == "vtt") && kairanSubtitleResolved) {
-                            // Kairan ASS가 없을 때는 스트림에서 제공하는 원래 VTT를 그대로 사용한다.
-                            if (subtitleSource == "none") {
-                                subtitlesUrl = it
-                                subtitleSource = "linkkf-vtt"
-                                Log.d("Subtitle", "USE_LINKKF_VTT url=$it")
-                            }
+                        if (kairanSubtitleResolved && subtitleSourcePreference == "linkkf") {
+                            subtitlesUrl = it
+                            subtitleSource = "linkkf-vtt"
+                            Log.d("Subtitle", "USE_LINKKF_VTT url=$it")
                         }
                     },
                     onQualitiesFound = { qualities ->
@@ -4706,8 +5069,32 @@ fun PlayerScreen(
             }
         }
 
+        // 잠금 상태에서는 PlayerView의 기본 컨트롤을 사용하지 않고,
+        // 화면 터치 시 잠금 버튼만 2초 동안 보여준다.
+        if (isPlayerLocked) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onTap = {
+                                showLockedButton = true
+                                lockedButtonRequest++
+                            }
+                        )
+                    }
+            )
+        }
+
+        LaunchedEffect(lockedButtonRequest, isPlayerLocked) {
+            if (isPlayerLocked && showLockedButton) {
+                delay(2000L)
+                showLockedButton = false
+            }
+        }
+
         AnimatedVisibility(
-            visible = isControlsVisible,
+            visible = isControlsVisible && !isPlayerLocked,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.TopCenter)
@@ -4720,7 +5107,9 @@ fun PlayerScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(
-                    onClick = back
+                    onClick = {
+                        if (isFullScreen) isFullScreen = false else back()
+                    }
                 ) {
                     Icon(
                         imageVector = Icons.Default.ArrowBack,
@@ -4730,6 +5119,7 @@ fun PlayerScreen(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Player settings are consolidated here in the top-right.
                     IconButton(onClick = { showPlayerSettingsDialog = true }) {
                         Icon(
                             imageVector = Icons.Default.Settings,
@@ -4799,7 +5189,7 @@ fun PlayerScreen(
             }
         }
 
-        buttonAniSkipSegment?.let { segment ->
+        if (vm.playerSettings.showAniSkipButton) buttonAniSkipSegment?.let { segment ->
             val label = if (segment.type == "op" || segment.type == "mixed-op") {
                 "OP 스킵"
             } else {
@@ -4915,6 +5305,70 @@ fun PlayerScreen(
                         HorizontalDivider()
                         Spacer(Modifier.height(16.dp))
 
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "OP/ED 스킵 버튼 표시",
+                                    fontWeight = FontWeight.Bold,
+                                    color = LilacDark
+                                )
+                                Text(
+                                    "재생화면에 나타나는 OP/ED 스킵 버튼을 표시합니다.",
+                                    fontSize = 11.sp,
+                                    color = Color.Gray
+                                )
+                            }
+                            Switch(
+                                checked = vm.playerSettings.showAniSkipButton,
+                                onCheckedChange = { enabled ->
+                                    vm.updatePlayerSettings(
+                                        context,
+                                        vm.playerSettings.copy(showAniSkipButton = enabled)
+                                    )
+                                }
+                            )
+                        }
+
+                        Spacer(Modifier.height(16.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(16.dp))
+
+                        Text("자막 소스", fontWeight = FontWeight.Bold, color = LilacDark)
+                        Text(
+                            "다운로드 시 Linkkf VTT와 Kairan ASS를 모두 저장하고, 재생할 소스를 여기서 선택합니다.",
+                            fontSize = 11.sp,
+                            color = Color.Gray
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterChip(
+                                selected = subtitleSourcePreference == "linkkf",
+                                onClick = { subtitleSourcePreference = "linkkf" },
+                                label = { Text("Linkkf VTT") }
+                            )
+                            FilterChip(
+                                selected = subtitleSourcePreference == "kairan",
+                                onClick = { subtitleSourcePreference = "kairan" },
+                                label = { Text("Kairan ASS") }
+                            )
+                        }
+                        Text(
+                            "Kairan은 현재 연결된 원본이 ASS 형식이므로 ASS 렌더러를 사용합니다.",
+                            fontSize = 10.sp,
+                            color = Color.Gray
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(16.dp))
+
                         Text("자막 설정", fontWeight = FontWeight.Bold, color = LilacDark)
                         Spacer(Modifier.height(10.dp))
 
@@ -4972,6 +5426,50 @@ fun PlayerScreen(
                                 Text("+250ms", fontSize = 11.sp)
                             }
                         }
+
+                        Spacer(Modifier.height(10.dp))
+
+                        Text("VTT 자막 싱크 입력", fontSize = 13.sp)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                value = syncOffsetText,
+                                onValueChange = { value ->
+                                    syncOffsetText = value.filter { it.isDigit() || it == '-' }
+                                    syncOffsetText.toLongOrNull()?.let { syncOffsetMs = it }
+                                },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                suffix = { Text("ms") }
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "양수 = 자막을 늦춤\n음수 = 자막을 앞당김",
+                                fontSize = 10.sp,
+                                color = Color.Gray
+                            )
+                        }
+
+                        Spacer(Modifier.height(10.dp))
+
+                        Text(
+                            "VTT 자막 위치 (${(subtitleBottomPaddingFraction * 100).toInt()}%)",
+                            fontSize = 13.sp
+                        )
+                        Slider(
+                            value = subtitleBottomPaddingFraction,
+                            onValueChange = { subtitleBottomPaddingFraction = it },
+                            valueRange = 0.03f..0.30f,
+                            steps = 26
+                        )
+                        Text(
+                            "값이 클수록 자막이 조금 더 위로 올라갑니다.",
+                            fontSize = 11.sp,
+                            color = Color.Gray
+                        )
 
                         Spacer(Modifier.height(10.dp))
 
@@ -5033,13 +5531,52 @@ fun PlayerScreen(
                 },
                 confirmButton = {
                     TextButton(onClick = { 
-                        vm.updatePlayerSettings(context, vm.playerSettings.copy(syncOffsetMs = syncOffsetMs, subtitleSize = subtitleSizePercent))
+                        vm.updatePlayerSettings(
+                            context,
+                            vm.playerSettings.copy(
+                                syncOffsetMs = syncOffsetText.toLongOrNull() ?: syncOffsetMs,
+                                subtitleSize = subtitleSizePercent,
+                                subtitleBottomPaddingFraction = subtitleBottomPaddingFraction,
+                                subtitleSourcePreference = subtitleSourcePreference
+                            )
+                        )
                         showPlayerSettingsDialog = false 
                     }) {
                         Text("확인")
                     }
                 }
             )
+        }
+        AnimatedVisibility(
+            visible = if (isPlayerLocked) showLockedButton else isControlsVisible,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 20.dp, bottom = 16.dp)
+                .size(48.dp)
+        ) {
+            IconButton(
+                onClick = {
+                    if (isPlayerLocked) {
+                        // 잠금 해제 후에는 일반 플레이어 컨트롤을 다시 사용할 수 있게 한다.
+                        isPlayerLocked = false
+                        showLockedButton = true
+                        isControlsVisible = true
+                    } else {
+                        // 잠금 상태에서는 잠금 버튼만 잠시 남긴다.
+                        isPlayerLocked = true
+                        showLockedButton = true
+                        lockedButtonRequest++
+                    }
+                }
+            ) {
+                Icon(
+                    imageVector = if (isPlayerLocked) Icons.Default.Lock else Icons.Default.LockOpen,
+                    contentDescription = if (isPlayerLocked) "잠금 해제" else "플레이어 잠금",
+                    tint = Color.White
+                )
+            }
         }
     }
 }
@@ -5056,8 +5593,6 @@ object KairanSubtitleService {
     private const val BLOG_URL = "https://kairan03.blogspot.com"
     private const val CACHE_DIR = "kairan_subtitles"
     private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
-    private const val MAX_SEARCH_CACHE = 64
-    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, List<KairanSearchResult>>()
 
     suspend fun findSubtitle(context: Context, title: String, episodeNumber: Int): KairanSubtitleResult? =
         withContext(Dispatchers.IO) {
@@ -5169,9 +5704,6 @@ object KairanSubtitleService {
 
 
     private fun searchKairanBlog(query: String): List<KairanSearchResult> {
-        val cacheKey = kairanSearchTitle(query)
-        searchCache[cacheKey]?.let { return it }
-
         return try {
             val encoded = URLEncoder.encode(query, "UTF-8")
             val url = "$BLOG_URL/search?q=$encoded"
@@ -5205,12 +5737,7 @@ object KairanSubtitleService {
 
                 if (code !in 200..299 || html.isBlank()) return emptyList()
 
-                val parsed = parseKairanSearchResults(html)
-                if (searchCache.size >= MAX_SEARCH_CACHE) {
-                    searchCache.keys.firstOrNull()?.let(searchCache::remove)
-                }
-                searchCache[cacheKey] = parsed
-                parsed
+                parseKairanSearchResults(html)
             } finally {
                 connection.disconnect()
             }
@@ -5394,6 +5921,16 @@ object KairanSubtitleService {
                     if (looksLikeHtml(temp)) { Log.w("Kairan", "DOWNLOAD_RETURNED_HTML"); temp.delete(); continue }
                     if (!isAssFile(temp)) { Log.w("Kairan", "DOWNLOAD_NOT_ASS"); temp.delete(); continue }
 
+                    val assInfo = inspectAssFile(temp)
+                    Log.d(
+                        "Kairan",
+                        "ASS_INFO dialogue=${assInfo.dialogueCount} " +
+                            "positioned=${assInfo.positionedCount} " +
+                            "moving=${assInfo.movingCount} " +
+                            "playRes=${assInfo.playResX}x${assInfo.playResY} " +
+                            "styles=${assInfo.styleCount}"
+                    )
+
                     val target = File(dir, "${safe}_${episode}.ass")
                     temp.copyTo(target, overwrite = true); temp.delete()
                     return target.absolutePath
@@ -5403,6 +5940,57 @@ object KairanSubtitleService {
             }
         }
         return null
+    }
+
+    private data class AssInfo(
+        val dialogueCount: Int,
+        val positionedCount: Int,
+        val movingCount: Int,
+        val playResX: Int?,
+        val playResY: Int?,
+        val styleCount: Int
+    )
+
+    private fun inspectAssFile(file: File): AssInfo = try {
+        val text = file.inputStream().bufferedReader().use { it.readText() }
+        val lower = text.lowercase(Locale.ROOT)
+
+        val dialogueLines = text.lineSequence()
+            .filter { it.trimStart().startsWith("dialogue:", ignoreCase = true) }
+            .toList()
+
+        val positioned = dialogueLines.count {
+            Regex("""\\pos\s*\(""", RegexOption.IGNORE_CASE).containsMatchIn(it)
+        }
+
+        val moving = dialogueLines.count {
+            Regex("""\\move\s*\(""", RegexOption.IGNORE_CASE).containsMatchIn(it)
+        }
+
+        val playResX = Regex(
+            """(?im)^\s*playresx\s*[:=]\s*(\d+)"""
+        ).find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        val playResY = Regex(
+            """(?im)^\s*playresy\s*[:=]\s*(\d+)"""
+        ).find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+        val styleCount = text.lineSequence().count {
+            val t = it.trimStart()
+            t.startsWith("style:", ignoreCase = true) ||
+                t.startsWith("format:", ignoreCase = true) && lower.contains("[v4+ styles]")
+        }
+
+        AssInfo(
+            dialogueCount = dialogueLines.size,
+            positionedCount = positioned,
+            movingCount = moving,
+            playResX = playResX,
+            playResY = playResY,
+            styleCount = styleCount
+        )
+    } catch (_: Exception) {
+        AssInfo(0, 0, 0, null, null, 0)
     }
 
     private fun isAssFile(file: File): Boolean = try {
@@ -5510,6 +6098,113 @@ fun StreamUrlExtractor(
     )
 }
 
+
+private suspend fun prepareSyncedSubtitleFile(
+    context: Context,
+    subtitlePath: String,
+    animeId: String,
+    episodeNumber: Int,
+    offsetMs: Long
+): String? = withContext(Dispatchers.IO) {
+    if (offsetMs == 0L) return@withContext subtitlePath
+
+    try {
+        val lower = subtitlePath.lowercase(Locale.ROOT)
+        if (!lower.endsWith(".vtt") && !lower.endsWith(".srt")) return@withContext null
+
+        val sourceText = if (
+            subtitlePath.startsWith("http://") || subtitlePath.startsWith("https://")
+        ) {
+            val connection = (URL(subtitlePath).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10000
+                readTimeout = 30000
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Android) LilacAnime/1.0")
+            }
+            try {
+                if (connection.responseCode !in 200..299) return@withContext null
+                connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            } finally {
+                connection.disconnect()
+            }
+        } else {
+            File(
+                subtitlePath.removePrefix("file://")
+            ).takeIf { it.isFile }?.readText(Charsets.UTF_8) ?: return@withContext null
+        }
+
+        val timestampRegex = Regex(
+            """(\d{1,2}:)?\d{2}:\d{2}[.,]\d{3}\s*-->\s*(\d{1,2}:)?\d{2}:\d{2}[.,]\d{3}"""
+        )
+        val timePartRegex = Regex("""\d{1,2}:\d{2}:\d{2}[.,]\d{3}""")
+
+        fun parseTime(value: String): Long {
+            val normalized = value.replace(',', '.')
+            val parts = normalized.split(':')
+            return when (parts.size) {
+                2 -> {
+                    val sec = parts[0].toLong()
+                    val ms = parts[1].toLong()
+                    sec * 1000L + ms
+                }
+                3 -> {
+                    val hour = parts[0].toLong()
+                    val minute = parts[1].toLong()
+                    val secParts = parts[2].split('.')
+                    hour * 3_600_000L +
+                        minute * 60_000L +
+                        secParts[0].toLong() * 1000L +
+                        secParts.getOrNull(1)?.padEnd(3, '0')?.take(3)?.toLongOrNull().orZero()
+                }
+                else -> 0L
+            }
+        }
+
+        fun Long.formatVtt(): String {
+            val safe = coerceAtLeast(0L)
+            val h = safe / 3_600_000L
+            val m = (safe % 3_600_000L) / 60_000L
+            val s = (safe % 60_000L) / 1000L
+            val ms = safe % 1000L
+            return "%02d:%02d:%02d.%03d".format(Locale.ROOT, h, m, s, ms)
+        }
+
+        val adjusted = sourceText.lineSequence().joinToString("\n") { line ->
+            if (!timestampRegex.containsMatchIn(line)) {
+                line
+            } else {
+                timePartRegex.replace(line) { match ->
+                    (parseTime(match.value) + offsetMs).coerceAtLeast(0L).formatVtt()
+                }
+            }
+        }
+
+        val dir = File(context.filesDir, "synced_subtitles").apply { mkdirs() }
+        val safeOffset = if (offsetMs >= 0) "p$offsetMs" else "m${-offsetMs}"
+        val extension = if (lower.endsWith(".srt")) "srt" else "vtt"
+        val target = File(dir, "${animeId}_${episodeNumber}_${safeOffset}.$extension")
+        target.writeText(adjusted, Charsets.UTF_8)
+        Log.d("Subtitle", "SYNCED_FILE path=${target.absolutePath} offsetMs=$offsetMs")
+        target.absolutePath
+    } catch (e: Exception) {
+        Log.e("Subtitle", "SYNC_PREPARE_FAILED path=$subtitlePath offsetMs=$offsetMs", e)
+        null
+    }
+}
+
+private fun Long?.orZero(): Long = this ?: 0L
+
+object SubtitleStore {
+    private const val PREF_NAME = "lilac_subtitle_store"
+    private fun key(animeId: String, episodeNumber: Int, source: String) = "${animeId}_${episodeNumber}_$source"
+    suspend fun save(context: Context, animeId: String, episodeNumber: Int, source: String, path: String?) = withContext(Dispatchers.IO) {
+        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit().putString(key(animeId, episodeNumber, source), path).apply()
+    }
+    suspend fun get(context: Context, animeId: String, episodeNumber: Int, source: String): String? = withContext(Dispatchers.IO) {
+        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).getString(key(animeId, episodeNumber, source), null)?.takeIf { File(it).isFile }
+    }
+}
+
 suspend fun downloadSubtitleFile(
     context: Context, 
     animeId: String, 
@@ -5554,7 +6249,13 @@ object OfflineStore {
             putInt("pref_background_color", settings.backgroundColor)
             putInt("pref_stroke_color", settings.strokeColor)
             putLong("pref_sync_offset_ms", settings.syncOffsetMs)
+            putFloat(
+                "pref_subtitle_bottom_padding_fraction",
+                settings.subtitleBottomPaddingFraction
+            )
+            putString("pref_subtitle_source", settings.subtitleSourcePreference)
             putString("pref_custom_font_path", settings.customFontPath)
+            putBoolean("pref_show_ani_skip_button", settings.showAniSkipButton)
             apply()
         }
     }
@@ -5569,7 +6270,14 @@ object OfflineStore {
             backgroundColor = prefs.getInt("pref_background_color", android.graphics.Color.TRANSPARENT),
             strokeColor = prefs.getInt("pref_stroke_color", android.graphics.Color.BLACK),
             syncOffsetMs = prefs.getLong("pref_sync_offset_ms", 0L),
-            customFontPath = prefs.getString("pref_custom_font_path", null)
+            subtitleBottomPaddingFraction = prefs.getFloat(
+                "pref_subtitle_bottom_padding_fraction",
+                0.12f
+            ).coerceIn(0.03f, 0.45f),
+            subtitleSourcePreference = prefs.getString("pref_subtitle_source", "linkkf")
+                ?.takeIf { it == "linkkf" || it == "kairan" } ?: "linkkf",
+            customFontPath = prefs.getString("pref_custom_font_path", null),
+            showAniSkipButton = prefs.getBoolean("pref_show_ani_skip_button", true)
         )
     }
 
