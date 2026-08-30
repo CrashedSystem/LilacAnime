@@ -205,6 +205,12 @@ fun PlayerScreen(
     var selectedQualityOption by remember { mutableStateOf<ExoVideoQualityOption?>(null) }
     var showPlayerSettingsDialog by remember { mutableStateOf(false) }
 
+    // 재생 속도는 플레이어 화면 안에서 유지하고, 설정 메뉴에서 변경한다.
+    var playbackSpeed by rememberSaveable { mutableFloatStateOf(1.0f) }
+    val playbackSpeedOptions = remember {
+        listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+    }
+
     val fontPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -553,6 +559,11 @@ fun PlayerScreen(
             Log.d("Subtitle", "LIBASS_RELEASE")
             assHandler.release()
         }
+    }
+
+    // 속도 변경은 Media3/ExoPlayer에 즉시 반영한다.
+    LaunchedEffect(exoPlayer, playbackSpeed) {
+        exoPlayer.setPlaybackSpeed(playbackSpeed)
     }
 
     val forwardingPlayer = remember(exoPlayer, prevEpisode, nextEpisode) {
@@ -1346,6 +1357,57 @@ fun PlayerScreen(
                             .fillMaxWidth()
                             .verticalScroll(rememberScrollState())
                     ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("재생 속도", fontWeight = FontWeight.Bold, color = LilacDark)
+                            Text(
+                                "${String.format(java.util.Locale.US, "%.2f", playbackSpeed)}x",
+                                fontWeight = FontWeight.Bold,
+                                color = Lilac
+                            )
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Slider(
+                            value = playbackSpeedOptions.indexOf(playbackSpeed)
+                                .takeIf { it >= 0 }
+                                ?.toFloat() ?: 2f,
+                            onValueChange = { value ->
+                                val index = value.toInt().coerceIn(
+                                    0,
+                                    playbackSpeedOptions.lastIndex
+                                )
+                                playbackSpeed = playbackSpeedOptions[index]
+                            },
+                            valueRange = 0f..playbackSpeedOptions.lastIndex.toFloat(),
+                            steps = playbackSpeedOptions.size - 2,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("0.5x", fontSize = 11.sp, color = Color.Gray)
+                            Text("1.0x", fontSize = 11.sp, color = Color.Gray)
+                            Text("2.0x", fontSize = 11.sp, color = Color.Gray)
+                        }
+
+                        Text(
+                            "슬라이더를 움직이면 즉시 재생 속도가 변경됩니다.",
+                            fontSize = 12.sp,
+                            color = Color.Gray,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(16.dp))
+
                         Text("M3U8 화질 직접 선택", fontWeight = FontWeight.Bold, color = LilacDark)
                         Spacer(Modifier.height(6.dp))
 

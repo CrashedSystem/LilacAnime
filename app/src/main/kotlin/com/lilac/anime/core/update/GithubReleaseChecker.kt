@@ -113,19 +113,32 @@ object GithubReleaseChecker {
     }
 }
 
-suspend fun installApkWithPackageInstaller(context: Context, apkFile: File) = withContext(Dispatchers.IO) {
-    val installer = context.packageManager.packageInstaller
-    val params = android.content.pm.PackageInstaller.SessionParams(android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL)
-    params.setSize(apkFile.length())
-    val sessionId = installer.createSession(params)
-    val session = installer.openSession(sessionId)
+fun installApkWithPackageInstaller(context: Context, apkFile: File) {
+    if (!apkFile.isFile || apkFile.length() <= 0L) {
+        throw IllegalStateException("다운로드한 APK 파일이 없습니다.")
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+        !context.packageManager.canRequestPackageInstalls()
+    ) {
+        throw SecurityException("알 수 없는 앱 설치 권한이 허용되지 않았습니다.")
+    }
+
+    val apkUri = androidx.core.content.FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        apkFile
+    )
+
+    val installIntent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(apkUri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
     try {
-        apkFile.inputStream().use { input -> session.openWrite("base.apk", 0, apkFile.length()).use { output -> input.copyTo(output); session.fsync(output) } }
-        val intent = Intent(context, MainActivity::class.java).apply { action = "com.lilac.anime.UPDATE_RESULT"; addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP) }
-        val flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) android.app.PendingIntent.FLAG_IMMUTABLE else 0
-        val pending = android.app.PendingIntent.getActivity(context, sessionId, intent, flags)
-        session.commit(pending.intentSender)
-    } catch (e: Exception) { session.abandon(); throw e } finally { session.close() }
+        context.startActivity(installIntent)
+    } catch (e: android.content.ActivityNotFoundException) {
+        throw IllegalStateException("APK 설치 화면을 열 수 없습니다.", e)
+    }
 }
-
-

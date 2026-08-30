@@ -193,7 +193,9 @@ fun DetailScreen(
                 }
 
                 withContext(Dispatchers.IO) {
-                    // 오프라인 저장 시 Linkkf VTT와 Kairan ASS를 모두 저장한다.
+                    // 오프라인 저장 시 Linkkf VTT와 Kairan ASS를 각각 별도로 저장한다.
+                    // ASS는 vttUrl에 넣지 않는다. 오프라인에서는 VTT가 기본 자막으로 사용되고,
+                    // Kairan ASS는 SubtitleStore/로컬 캐시에서 별도 선택할 수 있다.
                     val localLinkkfPath = downloadSubtitleFile(
                         context, currentAnime.id, ep.number, vttUrl
                     )
@@ -217,7 +219,7 @@ fun DetailScreen(
                         animeId = currentAnime.id,
                         episode = ep.copy(
                             videoUrl = selectedQuality.url,
-                            vttUrl = localLinkkfPath ?: localKairanPath ?: vttUrl
+                            vttUrl = localLinkkfPath ?: vttUrl
                         )
                     )
                 }
@@ -250,7 +252,9 @@ fun DetailScreen(
                         }
 
                         withContext(Dispatchers.IO) {
-                            // 오프라인 저장 시 Linkkf VTT와 Kairan ASS를 모두 저장한다.
+                            // 오프라인 저장 시 Linkkf VTT와 Kairan ASS를 각각 별도로 저장한다.
+                    // ASS는 vttUrl에 넣지 않는다. 오프라인에서는 VTT가 기본 자막으로 사용되고,
+                    // Kairan ASS는 SubtitleStore/로컬 캐시에서 별도 선택할 수 있다.
                             val localLinkkfPath = downloadSubtitleFile(
                                 context, currentAnime.id, ep.number, vttUrl
                             )
@@ -274,7 +278,7 @@ fun DetailScreen(
                                 animeId = currentAnime.id,
                                 episode = ep.copy(
                                     videoUrl = selectedQuality.url,
-                                    vttUrl = localLinkkfPath ?: localKairanPath ?: vttUrl
+                                    vttUrl = localLinkkfPath ?: vttUrl
                                 )
                             )
                         }

@@ -23,6 +23,8 @@ object AniSkipService {
     private const val ANILIST_URL = "https://graphql.anilist.co"
     private const val KITSU_URL = "https://kitsu.io/api/edge"
 
+    private val ANISKIP_TYPES = setOf("op", "ed", "mixed-op", "mixed-ed")
+
     private data class MalCandidate(
         val malId: Int,
         val score: Int,
@@ -32,6 +34,18 @@ object AniSkipService {
         val romajiTitle: String? = null
     )
 
+    /**
+     * AniSkip 조회는 MAL ID를 찾은 뒤 한 번만 호출한다.
+     *
+     * 요청 타입:
+     * - op
+     * - ed
+     * - mixed-op
+     * - mixed-ed
+     *
+     * PlayerScreen에서 실제 영상 길이를 전달하므로 rough(episodeLength=0) 조회와
+     * exact 조회를 따로 하지 않는다.
+     */
     suspend fun getSkipTimes(
         title: String,
         episodeNumber: Int,
@@ -47,134 +61,97 @@ object AniSkipService {
             Log.d("AniSkip", "MAL_ID=$malId title=\"$title\"")
 
             if (malId == null) {
-                Log.e("AniSkip", "MAL ID를 찾지 못했습니다.")
+                Log.w("AniSkip", "MAL_ID_NOT_FOUND title=\"$title\"")
                 return@withContext emptyList()
             }
 
             val actualLength = episodeLengthSeconds.coerceAtLeast(0)
 
-            // 길이 필터 없는 결과와 실제 영상 길이로 조회한 결과를 모두 가져온다.
-            // 길이가 크게 다른 rough 결과를 먼저 선택하면 스킵 위치가 틀어질 수 있다.
             Log.d(
                 "AniSkip",
-                "FETCH rough malId=$malId episode=$episodeNumber episodeLength=0"
+                "FETCH_SINGLE malId=$malId episode=$episodeNumber episodeLength=$actualLength"
             )
-            val rough = requestSkipTimes(
+
+            val segments = requestSkipTimes(
                 malId = malId,
                 episodeNumber = episodeNumber,
-                episodeLength = 0
+                episodeLength = actualLength
             )
-
-            Log.d("AniSkip", "ROUGH_RESULT count=${rough.size} values=$rough")
-
-            val exact = if (actualLength > 0) {
-                Log.d(
-                    "AniSkip",
-                    "FETCH exact malId=$malId episode=$episodeNumber episodeLength=$actualLength"
-                )
-                requestSkipTimes(
-                    malId = malId,
-                    episodeNumber = episodeNumber,
-                    episodeLength = actualLength
-                )
-            } else {
-                emptyList()
-            }
-
-            Log.d("AniSkip", "EXACT_RESULT count=${exact.size} values=$exact")
-
-            val all = (rough + exact)
                 .distinctBy {
                     "${it.type}:${it.startTime}:${it.endTime}:${it.episodeLength}"
                 }
+                .sortedBy { it.startTime }
 
-            if (all.isEmpty()) {
+            if (segments.isEmpty()) {
                 Log.w(
                     "AniSkip",
                     "NO_SKIP_DATA malId=$malId episode=$episodeNumber actualLength=$actualLength"
                 )
-                return@withContext emptyList()
-            }
-
-            val selected = all
-                .groupBy { it.type }
-                .mapNotNull { (type, values) ->
-                    val chosen = values.minByOrNull { segment ->
-                        if (
-                            actualLength > 0 &&
-                            segment.episodeLength > 0.0
-                        ) {
-                            kotlin.math.abs(
-                                segment.episodeLength - actualLength.toDouble()
-                            )
-                        } else {
-                            Double.MAX_VALUE
-                        }
-                    }
-
-                    chosen?.also {
-                        Log.d(
-                            "AniSkip",
-                            "SELECT type=$type start=${it.startTime} end=${it.endTime} " +
-                                "sourceLength=${it.episodeLength} " +
-                                "localLength=$actualLength " +
-                                "lengthDiff=${
-                                    if (actualLength > 0 && it.episodeLength > 0.0)
-                                        it.episodeLength - actualLength
-                                    else
-                                        0.0
-                                }"
-                        )
-                    }
+            } else {
+                segments.forEach {
+                    Log.d(
+                        "AniSkip",
+                        "SEGMENT type=${it.type} start=${it.startTime} " +
+                            "end=${it.endTime} sourceLength=${it.episodeLength}"
+                    )
                 }
-                .sortedBy { it.startTime }
-
-            selected.forEach {
-                Log.d(
-                    "AniSkip",
-                    "SEGMENT type=${it.type} start=${it.startTime} " +
-                        "end=${it.endTime} sourceLength=${it.episodeLength}"
-                )
             }
 
-            selected
+            segments
         } catch (e: Exception) {
-            Log.e("AniSkip", "getSkipTimes exception", e)
+            Log.e("AniSkip", "GET_SKIP_TIMES_EXCEPTION", e)
             emptyList()
         }
     }
 
+    /**
+     * AniSkip API는 한 번만 호출한다.
+     *
+     * API Host와 Origin을 동일한 api.aniskip.com으로 맞춰 웹 요청과 최대한
+     * 같은 출처 정보를 제공한다. Referer 역시 같은 Origin을 사용한다.
+     */
     private fun requestSkipTimes(
         malId: Int,
         episodeNumber: Int,
         episodeLength: Int
     ): List<AniSkipSegment> {
+        val query = buildString {
+            append("types=op")
+            append("&types=ed")
+            append("&types=mixed-op")
+            append("&types=mixed-ed")
+
+            if (episodeLength > 0) {
+                append("&episodeLength=")
+                append(episodeLength)
+            }
+        }
+
         val url = URL(
-            "$BASE_URL/skip-times/$malId/$episodeNumber" +
-                "?types=op" +
-                "&types=ed" +
-                "&types=mixed-op" +
-                "&types=mixed-ed" +
-                "&episodeLength=$episodeLength"
+            "$BASE_URL/skip-times/$malId/$episodeNumber?$query"
         )
 
-        Log.d("AniSkip", "REQUEST $url")
+        Log.d("AniSkip", "REQUEST_SINGLE url=$url")
+        Log.d(
+            "AniSkip",
+            "REQUEST_HEADERS Origin=https://api.aniskip.com Referer=https://api.aniskip.com/"
+        )
 
         val connection = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 15000
-            readTimeout = 15000
+            connectTimeout = 15_000
+            readTimeout = 15_000
             useCaches = false
             instanceFollowRedirects = true
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("Accept-Encoding", "identity")
-            setRequestProperty("Connection", "close")
-            setRequestProperty("User-Agent", "Mozilla/5.0 (Android) LilacAnime/1.0")
+
+            setRequestProperty("Accept", "application/json, text/plain, */*")
+            setRequestProperty("Origin", "https://api.aniskip.com")
+            setRequestProperty("Referer", "https://api.aniskip.com/")
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/128.0.0.0 Mobile Safari/537.36")
         }
 
         return try {
             val responseCode = connection.responseCode
-            Log.d("AniSkip", "HTTP $responseCode url=$url")
 
             val stream = if (responseCode in 200..299) {
                 connection.inputStream
@@ -182,32 +159,52 @@ object AniSkipService {
                 connection.errorStream
             }
 
-            val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            Log.d("AniSkip", "BODY ${body.take(8000)}")
+            val body = stream
+                ?.bufferedReader(Charsets.UTF_8)
+                ?.use { it.readText() }
+                .orEmpty()
+
+            Log.d("AniSkip", "HTTP $responseCode url=$url")
+            Log.d("AniSkip", "RESPONSE_HEADERS ${connection.headerFields}")
+            Log.d("AniSkip", "BODY ${body.take(8_000)}")
 
             if (responseCode !in 200..299) {
-                Log.e("AniSkip", "HTTP_ERROR code=$responseCode body=${body.take(2000)}")
+                Log.e(
+                    "AniSkip",
+                    "HTTP_ERROR code=$responseCode body=${body.take(2_000)}"
+                )
                 return emptyList()
             }
 
             val root = JSONObject(body)
             val found = root.optBoolean("found", false)
-            Log.d("AniSkip", "FOUND=$found status=${root.optInt("statusCode", responseCode)}")
+            Log.d(
+                "AniSkip",
+                "FOUND=$found status=${root.optInt("statusCode", responseCode)}"
+            )
 
             val results = root.optJSONArray("results") ?: return emptyList()
 
             buildList {
                 for (i in 0 until results.length()) {
                     val item = results.optJSONObject(i) ?: continue
+
                     val type = item.optString("skipType").ifBlank {
                         item.optString("skip_type")
                     }
 
-                    if (type !in setOf("op", "ed", "mixed-op", "mixed-ed")) continue
+                    if (type !in ANISKIP_TYPES) continue
 
                     val interval = item.optJSONObject("interval") ?: continue
-                    val start = interval.optDouble("startTime", interval.optDouble("start_time", Double.NaN))
-                    val end = interval.optDouble("endTime", interval.optDouble("end_time", Double.NaN))
+
+                    val start = interval.optDouble(
+                        "startTime",
+                        interval.optDouble("start_time", Double.NaN)
+                    )
+                    val end = interval.optDouble(
+                        "endTime",
+                        interval.optDouble("end_time", Double.NaN)
+                    )
                     val sourceLength = item.optDouble(
                         "episodeLength",
                         item.optDouble("episode_length", 0.0)
