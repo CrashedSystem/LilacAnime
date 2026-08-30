@@ -145,8 +145,24 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CompletableDeferred
+
 class MainActivity : ComponentActivity() {
+
     private var refreshInstallPermission: (() -> Unit)? = null
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            Log.d(
+                "NotificationPermission",
+                if (granted) {
+                    "알림 권한 허용됨"
+                } else {
+                    "알림 권한 거부됨"
+                }
+            )
+        }
 
     override fun onResume() {
         super.onResume()
@@ -155,90 +171,230 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        requestNotificationPermission()
+
         setContent {
             val viewModel: AnimeViewModel = viewModel()
             val context = LocalContext.current
-            
-            var pendingRelease by remember { mutableStateOf<GithubReleaseInfo?>(null) }
-            var updateBusy by remember { mutableStateOf(false) }
-            var updateError by remember { mutableStateOf<String?>(null) }
+
+            var pendingRelease by remember {
+                mutableStateOf<GithubReleaseInfo?>(null)
+            }
+
+            var updateBusy by remember {
+                mutableStateOf(false)
+            }
+
+            var updateError by remember {
+                mutableStateOf<String?>(null)
+            }
+
             var installPermissionGranted by remember {
                 mutableStateOf(
                     Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
                         packageManager.canRequestPackageInstalls()
                 )
             }
+
             LaunchedEffect(Unit) {
                 refreshInstallPermission = {
-                    installPermissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
-                        packageManager.canRequestPackageInstalls()
+                    installPermissionGranted =
+                        Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                            packageManager.canRequestPackageInstalls()
+                }
+            }
+
+            DisposableEffect(Unit) {
+                onDispose {
+                    refreshInstallPermission = null
                 }
             }
 
             LaunchedEffect(Unit) {
                 viewModel.monitorNetwork(context)
                 viewModel.loadAnime(context)
+
                 val release = GithubReleaseChecker.check(context)
-                if (release != null) pendingRelease = release
+
+                if (release != null) {
+                    pendingRelease = release
+                }
             }
 
             LilacApp(vm = viewModel)
 
             pendingRelease?.let { release ->
                 AlertDialog(
-                    onDismissRequest = { if (!updateBusy) pendingRelease = null },
-                    title = { Text("새 버전이 있습니다") },
+                    onDismissRequest = {
+                        if (!updateBusy) {
+                            pendingRelease = null
+                        }
+                    },
+
+                    title = {
+                        Text("새 버전이 있습니다")
+                    },
+
                     text = {
                         Column {
                             Text("Lilac Anime ${release.tag}")
-                            if (release.name != release.tag) Text(release.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 6.dp))
-                            if (release.body.isNotBlank()) Text(release.body.take(700), fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
-                            if (updateBusy) Text("업데이트 파일을 다운로드하고 설치 준비 중입니다...", modifier = Modifier.padding(top = 12.dp), fontSize = 12.sp)
-                            updateError?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 8.dp), fontSize = 12.sp) }
+
+                            if (release.name != release.tag) {
+                                Text(
+                                    text = release.name,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(top = 6.dp)
+                                )
+                            }
+
+                            if (release.body.isNotBlank()) {
+                                Text(
+                                    text = release.body.take(700),
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(top = 10.dp)
+                                )
+                            }
+
+                            if (updateBusy) {
+                                Text(
+                                    text = "업데이트 파일을 다운로드하고 설치 준비 중입니다...",
+                                    modifier = Modifier.padding(top = 12.dp),
+                                    fontSize = 12.sp
+                                )
+                            }
+
+                            updateError?.let { error ->
+                                Text(
+                                    text = error,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.padding(top = 8.dp),
+                                    fontSize = 12.sp
+                                )
+                            }
                         }
                     },
+
                     confirmButton = {
                         if (release.apkUrl != null) {
-                            TextButton(enabled = !updateBusy, onClick = {
-                                updateError = null
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
-                                    installPermissionGranted = false
-                                    try {
-                                        context.startActivity(Intent(
-                                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                            Uri.parse("package:$packageName")
-                                        ))
-                                    } catch (_: Exception) {
-                                        context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES))
-                                    }
-                                } else {
-                                    installPermissionGranted = true
-                                    updateBusy = true
-                                    CoroutineScope(Dispatchers.Main).launch {
+                            TextButton(
+                                enabled = !updateBusy,
+
+                                onClick = {
+                                    updateError = null
+
+                                    // Android 8.0 이상:
+                                    // 알 수 없는 앱 설치 권한 확인
+                                    if (
+                                        Build.VERSION.SDK_INT >=
+                                        Build.VERSION_CODES.O &&
+                                        !packageManager.canRequestPackageInstalls()
+                                    ) {
+                                        installPermissionGranted = false
+
                                         try {
-                                            val apk = GithubReleaseChecker.downloadApk(context, release.apkUrl)
-                                            installApkWithPackageInstaller(context, apk)
-                                        } catch (e: Exception) {
-                                            updateError = "업데이트 설치를 시작하지 못했습니다: ${e.message ?: "알 수 없는 오류"}"
-                                            updateBusy = false
+                                            startActivity(
+                                                Intent(
+                                                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                                    Uri.parse(
+                                                        "package:$packageName"
+                                                    )
+                                                )
+                                            )
+                                        } catch (_: Exception) {
+                                            startActivity(
+                                                Intent(
+                                                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES
+                                                )
+                                            )
+                                        }
+
+                                    } else {
+                                        installPermissionGranted = true
+                                        updateBusy = true
+
+                                        CoroutineScope(
+                                            Dispatchers.Main
+                                        ).launch {
+                                            try {
+                                                val apk =
+                                                    GithubReleaseChecker
+                                                        .downloadApk(
+                                                            context,
+                                                            release.apkUrl
+                                                        )
+
+                                                installApkWithPackageInstaller(
+                                                    context,
+                                                    apk
+                                                )
+
+                                            } catch (e: Exception) {
+                                                updateError =
+                                                    "업데이트 설치를 시작하지 못했습니다: " +
+                                                    "${e.message ?: "알 수 없는 오류"}"
+
+                                                updateBusy = false
+                                            }
                                         }
                                     }
                                 }
-                            }) {
-                                Text(if (installPermissionGranted) "앱에서 설치" else "설치 권한 허용")
+                            ) {
+                                Text(
+                                    if (installPermissionGranted) {
+                                        "앱에서 설치"
+                                    } else {
+                                        "설치 권한 허용"
+                                    }
+                                )
                             }
+
                         } else {
-                            TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(release.releaseUrl))); pendingRelease = null }) { Text("릴리스 페이지") }
+                            TextButton(
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(
+                                            Intent.ACTION_VIEW,
+                                            Uri.parse(release.releaseUrl)
+                                        )
+                                    )
+
+                                    pendingRelease = null
+                                }
+                            ) {
+                                Text("릴리스 페이지")
+                            }
                         }
                     },
-                    dismissButton = { TextButton(enabled = !updateBusy, onClick = { pendingRelease = null }) { Text("나중에") } }
+
+                    dismissButton = {
+                        TextButton(
+                            enabled = !updateBusy,
+
+                            onClick = {
+                                pendingRelease = null
+                            }
+                        ) {
+                            Text("나중에")
+                        }
+                    }
                 )
             }
         }
     }
+
+    private fun requestNotificationPermission() {
+
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(
+                Manifest.permission.POST_NOTIFICATIONS
+            )
+        }
+    }
 }
-
-// ============================================================
-// VIEW MODEL
-// ============================================================
-

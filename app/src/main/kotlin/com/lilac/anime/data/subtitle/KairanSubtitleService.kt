@@ -1,79 +1,60 @@
 package com.lilac.anime
 
-import kotlinx.coroutines.withTimeoutOrNull
-
 import android.content.Context
 import android.util.Log
-import androidx.compose.foundation.layout.*
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.datastore.preferences.core.edit
-import com.lilac.anime.data.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 import java.util.Locale
+
 object KairanSubtitleService {
-    private const val BLOG_URL = "https://kairan03.blogspot.com"
+    private const val TAG = "Kairan"
     private const val CACHE_DIR = "kairan_subtitles"
+    private const val POST_CACHE_PREFS = "kairan_post_cache"
     private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 
     suspend fun findSubtitle(context: Context, title: String, episodeNumber: Int): KairanSubtitleResult? =
         withContext(Dispatchers.IO) {
             try {
-                Log.d("Kairan", "START_SEARCH title=[$title] episode=$episodeNumber")
+                Log.d(TAG, "START_SEARCH title=[$title] episode=$episodeNumber")
 
                 SubtitleStore.get(context, normalizeTitleForFile(title), episodeNumber, "kairan")
                     ?.takeIf { File(it).isFile }
-                    ?.let { return@withContext KairanSubtitleResult.DirectFile(it) }
+                    ?.let {
+                        Log.d(TAG, "LOCAL_SUBTITLE_HIT path=$it")
+                        return@withContext KairanSubtitleResult.DirectFile(it)
+                    }
 
                 val postUrl = findBlogPost(context, title, episodeNumber)
-                if (postUrl == null) {
-                    Log.w("Kairan", "POST_NOT_FOUND title=[$title] episode=$episodeNumber")
-                    return@withContext null
-                }
+                    ?: run {
+                        Log.w(TAG, "POST_NOT_FOUND title=[$title] episode=$episodeNumber")
+                        return@withContext null
+                    }
 
-                Log.d("Kairan", "POST_FOUND title=[$title] episode=$episodeNumber url=$postUrl")
+                Log.d(TAG, "POST_FOUND url=$postUrl")
                 val html = getText(postUrl)
-                Log.d("Kairan", "POST_HTML_LOADED bytes=${html.length}")
-
                 val links = extractGoogleDriveLinks(html)
-                Log.d("Kairan", "DRIVE_LINK_COUNT count=${links.size}")
+                Log.d(TAG, "DRIVE_LINK_COUNT count=${links.size}")
 
                 for (link in links) {
-                    val id = extractGoogleDriveId(link)
-                    if (id == null) {
-                        Log.w("Kairan", "INVALID_DRIVE_LINK url=$link")
-                        continue
-                    }
-                    Log.d("Kairan", "TRY_DRIVE fileId=$id url=$link")
+                    val id = extractGoogleDriveId(link) ?: continue
                     val local = downloadGoogleDriveSubtitle(context, id, title, episodeNumber)
                     if (local != null) {
-                        Log.d("Kairan", "SUBTITLE_READY path=$local")
+                        Log.d(TAG, "SUBTITLE_READY path=$local")
                         return@withContext KairanSubtitleResult.DirectFile(local)
                     }
                 }
 
-                Log.w("Kairan", "DRIVE_SUBTITLE_NOT_FOUND url=$postUrl")
+                Log.w(TAG, "DRIVE_SUBTITLE_NOT_FOUND url=$postUrl")
                 null
             } catch (e: Exception) {
-                Log.e("Kairan", "FIND_SUBTITLE_FAILED title=[$title] ep=$episodeNumber", e)
+                Log.e(TAG, "FIND_SUBTITLE_FAILED title=[$title] ep=$episodeNumber", e)
                 null
             }
         }
-
-    private data class KairanSearchResult(
-        val title: String,
-        val url: String
-    )
-
-    private const val POST_CACHE_PREFS = "kairan_post_cache"
-    private const val SEARCH_TOTAL_TIMEOUT_MS = 4500L
 
     private fun postCacheKey(title: String, episode: Int): String =
         "${normalizeTitleForFile(title)}#$episode"
@@ -85,232 +66,32 @@ object KairanSubtitleService {
 
     private fun cachePostUrl(context: Context, title: String, episode: Int, url: String) {
         context.getSharedPreferences(POST_CACHE_PREFS, Context.MODE_PRIVATE)
-            .edit().putString(postCacheKey(title, episode), url).apply()
+            .edit()
+            .putString(postCacheKey(title, episode), url)
+            .apply()
     }
 
     private suspend fun findBlogPost(context: Context, title: String, episode: Int): String? {
         cachedPostUrl(context, title, episode)?.let { cached ->
-            Log.d("Kairan", "POST_CACHE_HIT episode=$episode url=$cached")
+            Log.d(TAG, "POST_CACHE_HIT episode=$episode url=$cached")
             return cached
         }
 
-        val normalizedTitle = kairanSearchTitle(title)
-        if (normalizedTitle.isBlank()) return null
-
-        val words = normalizedTitle.split(' ')
-            .filter { it.length >= 2 }
-            .distinct()
-            .sortedByDescending { it.length }
-
-        // Fast path: one full-title request first. Only use 1~2 core words as fallback.
-        val fallbackQueries = words.take(2)
-            .filter { it != normalizedTitle }
-        val searchQueries = buildList {
-            add(normalizedTitle)
-            addAll(fallbackQueries)
-        }.distinct()
-
-        val deadlineResult = withTimeoutOrNull(SEARCH_TOTAL_TIMEOUT_MS) {
-            for (query in searchQueries) {
-                val results = searchKairanBlog(query)
-                Log.d("Kairan", "BLOG_SEARCH_RESULTS query=[$query] count=${results.size}")
-
-                var bestUrl: String? = null
-                var bestScore = Int.MIN_VALUE
-                for (result in results) {
-                    val titleScore = scoreKairanSearchTitle(title, result.title)
-                    val episodeMatch = hasKairanEpisode(result.title, result.url, episode)
-                    if (titleScore <= 0 || !episodeMatch) continue
-                    if (titleScore > bestScore) {
-                        bestScore = titleScore
-                        bestUrl = result.url
-                    }
-                }
-
-                if (bestUrl != null) {
-                    Log.d("Kairan", "BLOG_SEARCH_MATCH score=$bestScore query=[$query] url=$bestUrl")
-                    return@withTimeoutOrNull bestUrl
-                }
-            }
-            null
+        val posts = KairanBlogRepository.getPosts(context)
+        if (posts.isEmpty()) {
+            Log.w(TAG, "BLOG_INDEX_EMPTY")
+            return null
         }
 
-        deadlineResult?.let { cachePostUrl(context, title, episode, it) }
-        if (deadlineResult == null) {
-            Log.w("Kairan", "BLOG_SEARCH_TIMEOUT_OR_MISS title=[$title] episode=$episode")
-        }
-        return deadlineResult
-    }
-
-    private fun searchKairanBlog(query: String): List<KairanSearchResult> {
-        return try {
-            val encoded = URLEncoder.encode(query, "UTF-8")
-            val url = "$BLOG_URL/search?q=$encoded"
-            Log.d("Kairan", "BLOG_SEARCH_REQUEST url=$url")
-
-            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 2500
-                readTimeout = 3500
-                useCaches = false
-                instanceFollowRedirects = true
-                setRequestProperty("User-Agent", USER_AGENT)
-                setRequestProperty(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                )
-                setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
-            }
-
-            try {
-                val code = connection.responseCode
-                val html = (
-                    if (code in 200..299) connection.inputStream
-                    else connection.errorStream
-                )?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-
-                Log.d(
-                    "Kairan",
-                    "BLOG_SEARCH_HTTP code=$code bytes=${html.length} query=[$query]"
-                )
-
-                if (code !in 200..299 || html.isBlank()) return emptyList()
-
-                parseKairanSearchResults(html)
-            } finally {
-                connection.disconnect()
-            }
-        } catch (e: Exception) {
-            Log.w("Kairan", "BLOG_SEARCH_FAILED query=[$query]", e)
-            emptyList()
-        }
-    }
-
-    private fun parseKairanSearchResults(html: String): List<KairanSearchResult> {
-        val out = linkedMapOf<String, KairanSearchResult>()
-
-        // Blogger themes normally render search-result post titles as links
-        // inside .post-title/.entry-title, but custom Kairan themes can vary.
-        // Therefore inspect all anchors and keep only real Blogger post URLs.
-        val anchorRegex = Regex(
-            """<a\b[^>]*href\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        )
-
-        for (match in anchorRegex.findAll(html)) {
-            val rawUrl = htmlDecode(match.groupValues[1]).trim()
-            val rawTitle = htmlDecode(stripHtml(match.groupValues[2])).trim()
-            if (rawTitle.isBlank()) continue
-
-            val postUrl = normalizeKairanPostUrl(rawUrl) ?: continue
-            val key = postUrl.lowercase(Locale.ROOT)
-            if (key !in out) {
-                out[key] = KairanSearchResult(rawTitle, postUrl)
-            }
+        val match = KairanPostMatcher.findBestMatch(title, episode, posts)
+        if (match == null) {
+            Log.w(TAG, "BLOG_MATCH_MISS title=[$title] episode=$episode")
+            return null
         }
 
-        return out.values.toList()
-    }
-
-    private fun normalizeKairanPostUrl(rawUrl: String): String? {
-        val decoded = rawUrl
-            .replace("\\/", "/")
-            .replace("&amp;", "&")
-            .trim()
-
-        val absolute = when {
-            decoded.startsWith("https://kairan03.blogspot.com/") -> decoded
-            decoded.startsWith("http://kairan03.blogspot.com/") ->
-                decoded.replaceFirst("http://", "https://")
-            decoded.startsWith("/") -> "$BLOG_URL$decoded"
-            else -> return null
-        }
-
-        // Blogger post permalinks use /YYYY/MM/slug.html.  Restricting to
-        // these URLs prevents menu/search/category links from becoming posts.
-        return if (
-            Regex(
-                """https?://kairan03\.blogspot\.com/\d{4}/\d{1,2}/[^\s"'<>]+\.html(?:[?#].*)?$""",
-                RegexOption.IGNORE_CASE
-            ).matches(absolute)
-        ) {
-            absolute
-        } else {
-            null
-        }
-    }
-
-    private fun stripHtml(value: String): String {
-        return value
-            .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), " ")
-            .replace(Regex("<[^>]+>"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
-
-    private fun htmlDecode(value: String): String {
-        return value
-            .replace("&amp;", "&", ignoreCase = true)
-            .replace("&quot;", "\"", ignoreCase = true)
-            .replace("&#39;", "'", ignoreCase = true)
-            .replace("&apos;", "'", ignoreCase = true)
-            .replace("&lt;", "<", ignoreCase = true)
-            .replace("&gt;", ">", ignoreCase = true)
-            .replace(Regex("&#(\\d+);")) { m ->
-                m.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: m.value
-            }
-    }
-
-    private fun kairanSearchTitle(value: String): String {
-        return value
-            .lowercase(Locale.ROOT)
-            .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-    }
-
-    private fun scoreKairanSearchTitle(query: String, postTitle: String): Int {
-        val left = kairanSearchTitle(query)
-        val right = kairanSearchTitle(postTitle)
-        if (left.isBlank() || right.isBlank()) return 0
-        if (left == right) return 10000
-        if (right.contains(left) || left.contains(right)) return 8000
-
-        val leftWords = left.split(' ').filter { it.isNotBlank() }.toSet()
-        val rightWords = right.split(' ').filter { it.isNotBlank() }.toSet()
-        if (leftWords.isEmpty() || rightWords.isEmpty()) return 0
-
-        val overlap = leftWords.intersect(rightWords).size
-        if (overlap == 0) return 0
-
-        val ratio = overlap.toDouble() / minOf(leftWords.size, rightWords.size).toDouble()
-        return when {
-            ratio >= 0.75 -> 6000
-            ratio >= 0.5 -> 4000
-            else -> 0
-        }
-    }
-
-    private fun hasKairanEpisode(postTitle: String, url: String, episode: Int): Boolean {
-        if (episode <= 0) return false
-
-        val title = kairanSearchTitle(postTitle)
-        val urlText = url.lowercase(Locale.ROOT)
-        val ep = episode.toString()
-
-        val explicitPatterns = listOf(
-            Regex("(?:^|\\s|[\\[\\]\\(\\)_.-])0*$ep(?:\\s*화|\\s*회|\\s*편|\\s*話)(?:$|\\s|[\\[\\]\\(\\)_.-])", RegexOption.IGNORE_CASE),
-            Regex("(?:^|\\s|[\\[\\]\\(\\)_.-])(?:ep|e|episode|#)\\s*0*$ep(?:$|\\s|[\\[\\]\\(\\)_.-])", RegexOption.IGNORE_CASE),
-            Regex("(?:^|\\s|[\\[\\]\\(\\)_.-])0*$ep(?:$|\\s|[\\[\\]\\(\\)_.-])", RegexOption.IGNORE_CASE)
-        )
-
-        if (explicitPatterns.any { it.containsMatchIn(title) }) return true
-
-        val urlEpisode = Regex(
-            "(?:-|_)0*$ep\\.html(?:$|[?#])",
-            RegexOption.IGNORE_CASE
-        )
-        return urlEpisode.containsMatchIn(urlText)
+        Log.d(TAG, "BLOG_MATCH similarity=${match.similarity} title=[${match.post.title}] url=${match.post.url}")
+        cachePostUrl(context, title, episode, match.post.url)
+        return match.post.url
     }
 
     private fun extractGoogleDriveLinks(html: String): List<String> {
