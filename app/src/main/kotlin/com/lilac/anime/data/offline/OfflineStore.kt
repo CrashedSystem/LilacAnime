@@ -36,6 +36,8 @@ object OfflineStore {
             putBoolean("pref_show_ani_skip_button", settings.showAniSkipButton)
             putInt("pref_double_tap_seek_seconds", settings.doubleTapSeekSeconds)
             putFloat("pref_playback_speed", settings.playbackSpeed)
+            putBoolean("pref_vtt_bold", settings.vttBold)
+            putFloat("pref_vtt_outline_width", settings.vttOutlineWidth)
             apply()
         }
     }
@@ -83,7 +85,9 @@ object OfflineStore {
             playbackSpeed = prefs.getFloat("pref_playback_speed", 1.0f).let { saved ->
                 val options = floatArrayOf(0.1f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
                 options.minByOrNull { kotlin.math.abs(it - saved) } ?: 1.0f
-            }
+            },
+            vttBold = prefs.getBoolean("pref_vtt_bold", true),
+            vttOutlineWidth = prefs.getFloat("pref_vtt_outline_width", 2.0f).coerceIn(0.5f, 6.0f)
         )
     }
 

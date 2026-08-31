@@ -75,11 +75,16 @@ object CsoraSubtitleService {
             // Some Csora posts provide fonts separately from the subtitle ZIP.
             // Font failures must never discard an otherwise valid subtitle.
             downloadFontLinks(context, fontLinks, title)
-            val selected = if (candidates.all { it.path.endsWith(".ass", true) || it.path.endsWith(".ssa", true) }) {
-                SubtitleAssetUtil.resolveAssCandidates(context, title, episodeNumber, candidates)
-            } else {
-                candidates.first().path
+            val episodeValidCandidates = candidates.filter {
+                SubtitleStore.subtitleMatchesEpisode(it.path, episodeNumber)
             }
+            Log.d(TAG, "EPISODE_VALIDATION requested=$episodeNumber total=${candidates.size} valid=${episodeValidCandidates.size}")
+            val selected = if (episodeValidCandidates.all { it.path.endsWith(".ass", true) || it.path.endsWith(".ssa", true) }) {
+                SubtitleAssetUtil.resolveAssCandidates(context, title, episodeNumber, episodeValidCandidates)
+            } else {
+                episodeValidCandidates.firstOrNull()?.path
+            }
+            candidates.filter { it !in episodeValidCandidates }.forEach { File(it.path).delete() }
             if (selected != null) {
                 SubtitleStore.save(context, titleKey(title), episodeNumber, "csora", selected)
                 prefs.edit().putInt("asset_version:${titleKey(title)}#$episodeNumber", ASSET_SCHEMA_VERSION).apply()

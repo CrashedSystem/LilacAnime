@@ -1,8 +1,0 @@
-Kairan subtitle index fix
-
-- Invalidates the legacy 150-post index once using an index cache version.
-- Reads Blogger openSearch$totalResults and paginates until the full index is reached.
-- On a match miss, performs one explicit full index refresh before giving up.
-- Adds logs for page start/count/total and refresh behavior.
-
-This is based on LilacAnime_Android_LTE_network_fix.zip.

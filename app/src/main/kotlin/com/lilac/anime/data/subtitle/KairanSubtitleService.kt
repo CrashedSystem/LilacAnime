@@ -20,7 +20,7 @@ object KairanSubtitleService {
     private const val TAG = "Kairan"
     private const val CACHE_DIR = "kairan_subtitles"
     private const val POST_CACHE_PREFS = "kairan_post_cache"
-    private const val ASSET_SCHEMA_VERSION = 2
+    private const val ASSET_SCHEMA_VERSION = 3
     private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 
     suspend fun findSubtitle(context: Context, title: String, episodeNumber: Int): KairanSubtitleResult? =
@@ -86,7 +86,7 @@ object KairanSubtitleService {
         }
 
     private fun postCacheKey(title: String, episode: Int): String =
-        "${normalizeTitleForFile(title)}#$episode"
+        "v3:${normalizeTitleForFile(title)}#$episode"
 
     private fun cachedPostUrl(context: Context, title: String, episode: Int): String? =
         context.getSharedPreferences(POST_CACHE_PREFS, Context.MODE_PRIVATE)
@@ -208,6 +208,11 @@ object KairanSubtitleService {
                         val out = File(dir, "${safe}_${episode}_direct_${System.currentTimeMillis()}$ext")
                         temp.copyTo(out, overwrite = true)
                         temp.delete()
+                        if (!SubtitleStore.subtitleMatchesEpisode(out.absolutePath, episode)) {
+                            Log.w(TAG, "DIRECT_ASS_EPISODE_MISMATCH requested=$episode path=${out.name}")
+                            out.delete()
+                            continue
+                        }
                         return DownloadAssetResult(listOf(out.absolutePath), 3, 0)
                     }
 
@@ -367,16 +372,48 @@ object KairanSubtitleService {
                 return if (fontCount > 0) DownloadAssetResult(emptyList(), 0, fontCount) else null
             }
 
-            val episodeRegex = Regex("(?i)(?:^|[^0-9])(?:ep(?:isode)?|e)?\\s*0*${episode}(?:[^0-9]|$)")
-            val exact = subtitles.filter { episodeRegex.containsMatchIn(it.first) }
-            val selected = if (exact.isNotEmpty()) exact else subtitles
+            // Do not fall back to another episode when the archive contains
+            // episode-numbered subtitle files.
+            val exact = subtitles.filter { subtitleEpisodeNumber(it.first) == episode }
+            val numbered = subtitles.filter { subtitleEpisodeNumber(it.first) != null }
+            val selected = when {
+                exact.isNotEmpty() -> exact
+                numbered.isNotEmpty() -> {
+                    Log.w(TAG, "ZIP_EPISODE_MISMATCH requested=$episode numbered=${numbered.map { it.first }}")
+                    emptyList()
+                }
+                else -> subtitles
+            }
             Log.d(TAG, "ZIP_SUBTITLES_FOUND count=${selected.size} entries=${selected.map { it.first }} fonts=$fontCount")
-            DownloadAssetResult(selected.map { it.second.absolutePath }, 2, fontCount)
+            val contentValid = selected.filter {
+                SubtitleStore.subtitleMatchesEpisode(it.second.absolutePath, episode)
+            }
+            if (contentValid.isEmpty()) {
+                Log.w(TAG, "ZIP_ASS_CONTENT_MISMATCH requested=$episode entries=${selected.map { it.first }}")
+                subtitles.forEach { it.second.delete() }
+                return if (fontCount > 0) DownloadAssetResult(emptyList(), 0, fontCount) else null
+            }
+            DownloadAssetResult(contentValid.map { it.second.absolutePath }, 2, fontCount)
         } catch (e: Exception) {
             subtitles.forEach { it.second.delete() }
             Log.w(TAG, "ZIP_EXTRACT_FAILED", e)
             null
         }
+    }
+
+    private fun subtitleEpisodeNumber(name: String): Int? {
+        val base = File(name.replace('\\', '/')).nameWithoutExtension.lowercase(Locale.ROOT)
+        val patterns = listOf(
+            Regex("""(?:^|[^0-9])(?:episode|ep|e|#)\s*0*(\d{1,3})(?:$|[^0-9])""", RegexOption.IGNORE_CASE),
+            Regex("""(?:^|[^0-9])0*(\d{1,3})\s*(?:화|회|편|話)(?:$|[^0-9])"""),
+            Regex("""(?:^|[_ .-])0*(\d{1,3})(?:$|[_ .-])""")
+        )
+        return patterns.take(2).asSequence()
+            .mapNotNull { it.find(base)?.groupValues?.getOrNull(1)?.toIntOrNull() }
+            .firstOrNull()
+            ?: patterns[2].findAll(base)
+                .mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }
+                .lastOrNull()
     }
 
     private fun detectSubtitleExtension(file: File): String =

@@ -17,7 +17,10 @@ object KairanPostMatcher {
         Log.d("KairanMatcher", "QUERY_NORMALIZED original=[$animeTitle] normalized=[$normalizedAnimeTitle] posts=${posts.size}")
 
         val candidates = posts.asSequence()
-            .filter { episodeMatch(it.title, it.url, episodeNumber) }
+            .filter {
+                episodeMatch(it.title, it.url, episodeNumber) &&
+                    seasonCompatible(animeTitle, it.title, it.url)
+            }
             .map { post ->
                 val candidateTitle = removeEpisodeTokens(post.title, episodeNumber)
                 val normalizedCandidate = KairanTitleNormalizer.normalize(candidateTitle)
@@ -45,6 +48,9 @@ object KairanPostMatcher {
                         "TITLE_ONLY_COMPARE query=[$normalizedAnimeTitle] candidate=[${post.title}] normalized=[$normalizedCandidate] score=$score"
                     )
                     KairanMatch(post, score)
+                }
+                .filter { match ->
+                    seasonCompatible(animeTitle, match.post.title, match.post.url)
                 }
                 .filter { match ->
                     val normalizedCandidate = normalizePostTitleForTitleOnly(match.post.title)
@@ -80,6 +86,39 @@ object KairanPostMatcher {
         // 제목 매칭 단계에서만 두 표기를 같은 후보군으로 취급한다.
         value = value.replace("카구야", "가구야")
         return KairanTitleNormalizer.normalize(value)
+    }
+
+    /**
+     * Re:Zero and similar titles reuse the same base title across seasons.
+     * The old normalizer discarded digits, so a 4th-season query could match a
+     * 1st-season post. When the query or candidate explicitly declares a season,
+     * require the same season number.
+     */
+    private fun seasonCompatible(queryTitle: String, candidateTitle: String, candidateUrl: String): Boolean {
+        val querySeason = extractSeasonNumber(queryTitle)
+        if (querySeason == null) return true
+
+        val candidateSeason = extractSeasonNumber(candidateTitle)
+            ?: extractSeasonNumber(candidateUrl)
+
+        // If the candidate explicitly declares another season, it is never a match.
+        if (candidateSeason != null && candidateSeason != querySeason) return false
+
+        // Prefer an explicitly season-tagged candidate. Candidates without a season
+        // marker are allowed because some Blogger posts omit it from the title.
+        return true
+    }
+
+    private fun extractSeasonNumber(value: String): Int? {
+        val text = value.lowercase(Locale.ROOT)
+        val patterns = listOf(
+            Regex("""(?<!\d)(\d{1,2})\s*(?:기|期|시즌|season)(?![a-z])"""),
+            Regex("""(?<![a-z])(\d{1,2})(?:st|nd|rd|th)\s+season(?![a-z])""", RegexOption.IGNORE_CASE),
+            Regex("""(?:season|s)\s*(\d{1,2})(?!\d)""", RegexOption.IGNORE_CASE)
+        )
+        return patterns.asSequence()
+            .mapNotNull { it.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull() }
+            .firstOrNull()
     }
 
     fun filterNoise(input: String): String = HangulSimilarityMatcher.filterNoise(input)

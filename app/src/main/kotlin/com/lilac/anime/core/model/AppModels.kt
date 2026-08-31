@@ -31,7 +31,10 @@ data class PlayerSettings(
     // 좌/우 더블 탭 시 이동할 시간(초)
     val doubleTapSeekSeconds: Int = 10,
     // 기본 재생 배속
-    val playbackSpeed: Float = 1.0f
+    val playbackSpeed: Float = 1.0f,
+    // VTT 전용 표시 설정
+    val vttBold: Boolean = true,
+    val vttOutlineWidth: Float = 2.0f
 )
 
 data class ExoVideoQualityOption(

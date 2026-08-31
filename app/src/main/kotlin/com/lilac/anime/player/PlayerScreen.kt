@@ -13,6 +13,8 @@ import android.view.MotionEvent
 import android.view.GestureDetector
 import android.view.WindowManager
 import android.widget.Toast
+import android.widget.TextView
+import android.graphics.Paint
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -67,6 +69,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
+import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -238,6 +241,76 @@ fun findLocalKairanAssSubtitle(
 
 @SuppressLint("SourceLockedOrientationActivity")
 @OptIn(UnstableApi::class)
+private class KeyboardPlayerView(context: Context) : PlayerView(context) {
+    var seekSeconds: Int = 10
+
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+            val p = player
+            val delta = seekSeconds.coerceAtLeast(1) * 1000L
+            when (event.keyCode) {
+                android.view.KeyEvent.KEYCODE_DPAD_LEFT,
+                android.view.KeyEvent.KEYCODE_MEDIA_REWIND -> {
+                    p?.seekTo((p.currentPosition - delta).coerceAtLeast(0L))
+                    return true
+                }
+                android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+                android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
+                    val target = p?.currentPosition?.plus(delta) ?: return true
+                    val duration = p.duration
+                    p.seekTo(if (duration != C.TIME_UNSET && duration > 0L) minOf(target, duration) else target)
+                    return true
+                }
+                android.view.KeyEvent.KEYCODE_SPACE,
+                android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                    p?.let { if (it.isPlaying) it.pause() else it.play() }
+                    return true
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+}
+
+@SuppressLint("SourceLockedOrientationActivity")
+@OptIn(UnstableApi::class)
+private class VttStrokeTextView(context: Context) : TextView(context) {
+    var outlineWidthPx: Float = 0f
+    var outlineColor: Int = android.graphics.Color.BLACK
+
+    init {
+        setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        includeFontPadding = true
+    }
+
+    override fun onDraw(canvas: android.graphics.Canvas) {
+        if (outlineWidthPx <= 0.01f || text.isNullOrEmpty()) {
+            super.onDraw(canvas)
+            return
+        }
+        val originalStyle = paint.style
+        val originalStroke = paint.strokeWidth
+        val originalColor = currentTextColor
+
+        // Use the VTT glyph itself as the mask: a black stroke is drawn first,
+        // then the original glyph is drawn over it. This makes the border grow
+        // outward instead of eating into the subtitle fill.
+        paint.style = android.graphics.Paint.Style.STROKE
+        paint.strokeWidth = outlineWidthPx * 2f
+        paint.strokeJoin = android.graphics.Paint.Join.ROUND
+        paint.strokeCap = android.graphics.Paint.Cap.ROUND
+        setTextColor(outlineColor)
+        super.onDraw(canvas)
+
+        paint.style = android.graphics.Paint.Style.FILL
+        paint.strokeWidth = originalStroke
+        setTextColor(originalColor)
+        super.onDraw(canvas)
+
+        paint.style = originalStyle
+    }
+}
+
 @Composable
 fun PlayerScreen(
     anime: Anime,
@@ -298,8 +371,19 @@ fun PlayerScreen(
         mutableStateOf(vm.playerSettings.syncOffsetMs.toString())
     }
     var isVttStyleEnabled by rememberSaveable { mutableStateOf(true) }
+    var vttBold by rememberSaveable { mutableStateOf(vm.playerSettings.vttBold) }
+    var vttOutlineWidth by rememberSaveable { mutableFloatStateOf(vm.playerSettings.vttOutlineWidth) }
+    var vttCueText by remember { mutableStateOf("") }
+    var vttOverlayRef by remember { mutableStateOf<VttStrokeTextView?>(null) }
     var customTypeface by remember { mutableStateOf<Typeface?>(null) }
     var customFontName by remember { mutableStateOf<String?>(null) }
+    var selectedSubtitleFontPath by remember(anime.id, subtitleSource) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(anime.id, subtitleSource) {
+        selectedSubtitleFontPath = if (subtitleSource == "kairan" || subtitleSource == "csora") {
+            SubtitleStore.getSelectedFont(context, anime.id, subtitleSource)
+        } else null
+    }
 
     var parsedStreamingQualities by remember { mutableStateOf<List<StreamQuality>>(emptyList()) }
     var selectedStreamingQuality by remember { mutableStateOf<StreamQuality?>(null) }
@@ -309,6 +393,8 @@ fun PlayerScreen(
     var selectedQualityOption by remember { mutableStateOf<ExoVideoQualityOption?>(null) }
     var showPlayerSettingsDialog by remember { mutableStateOf(false) }
     var discoveredSubtitleFonts by remember { mutableStateOf<List<SubtitleAssetUtil.FontInfo>>(emptyList()) }
+    var savedSubtitles by remember { mutableStateOf<List<SubtitleStore.SavedSubtitle>>(emptyList()) }
+    var showSubtitleManager by remember { mutableStateOf(false) }
 
     LaunchedEffect(anime.title, subtitlesUrl, subtitleSource) {
         discoveredSubtitleFonts = withContext(Dispatchers.IO) {
@@ -537,7 +623,7 @@ fun PlayerScreen(
                 streamUrl = targetUrl
 
                 val storedSubtitle = offlineEp?.vttUrl ?: currentEpisode.vttUrl
-                val localStoredSubtitle = storedSubtitle?.takeIf { path -> path.startsWith("/") && File(path).isFile }
+                val localStoredSubtitle = storedSubtitle?.takeIf { path -> path.startsWith("/") && File(path).isFile && SubtitleStore.pathMatchesEpisode(path, currentEpisode.number) }
                 val localUserSubtitle = localStoredSubtitle?.takeIf { isLocalUserSubtitlePath(it) }
                 val localLinkkf = withContext(Dispatchers.IO) {
                     SubtitleStore.get(context, anime.id, currentEpisode.number, "linkkf")
@@ -582,7 +668,7 @@ fun PlayerScreen(
         }
 
         val storedSubtitle = offlineEp?.vttUrl ?: currentEpisode.vttUrl
-        val localStoredSubtitle = storedSubtitle?.takeIf { path -> path.startsWith("/") && File(path).isFile }
+        val localStoredSubtitle = storedSubtitle?.takeIf { path -> path.startsWith("/") && File(path).isFile && SubtitleStore.pathMatchesEpisode(path, currentEpisode.number) }
 
         if (isOffline || isDownloaded) {
             val localLinkkf = withContext(Dispatchers.IO) {
@@ -783,6 +869,14 @@ fun PlayerScreen(
 
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
+            override fun onCues(cueGroup: CueGroup) {
+                val text = cueGroup.cues
+                    .asSequence()
+                    .mapNotNull { it.text?.toString()?.takeIf { value -> value.isNotBlank() } }
+                    .joinToString("\n")
+                vttCueText = text
+            }
+
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 MainActivity.isVideoPlaying = isPlaying
                 val window = activity?.window
@@ -930,7 +1024,7 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(streamUrl, subtitlesUrl, subtitleSource, syncOffsetMs, isOffline, vm.playerSettings.subtitleFontPath, vm.playerSettings.subtitleFontSource) {
+    LaunchedEffect(streamUrl, subtitlesUrl, subtitleSource, syncOffsetMs, isOffline, selectedSubtitleFontPath) {
         val url = streamUrl ?: return@LaunchedEffect
         val isLocalFile = url.startsWith("file://") || url.startsWith("/")
 
@@ -1002,7 +1096,7 @@ fun PlayerScreen(
             if ((subtitleSource == "csora" || subtitleSource == "kairan") &&
                 (lowerSubPath.endsWith(".ass") || lowerSubPath.endsWith(".ssa"))) {
                 val loadedFonts = withContext(Dispatchers.IO) {
-                    loadSubtitleFontsForSource(context, subPath, subtitleSource, assHandler, vm.playerSettings.subtitleFontPath.takeIf { vm.playerSettings.subtitleFontSource == subtitleSource })
+                    loadSubtitleFontsForSource(context, subPath, subtitleSource, assHandler, selectedSubtitleFontPath)
                 }
                 Log.d("Subtitle", "ASS_FONT_COUNT source=$subtitleSource loaded=$loadedFonts subtitle=$subPath")
             }
@@ -1020,8 +1114,8 @@ fun PlayerScreen(
                 } ?: subPath
             } else subPath
 
-            val fontSelectedPath = vm.playerSettings.subtitleFontPath
-                .takeIf { vm.playerSettings.subtitleFontSource == subtitleSource && !it.isNullOrBlank() && File(it).isFile }
+            val fontSelectedPath = selectedSubtitleFontPath
+                .takeIf { (subtitleSource == "kairan" || subtitleSource == "csora") && !it.isNullOrBlank() && File(it).isFile }
             val fontAppliedSubtitlePath = if (fontSelectedPath != null && (lowerSubPath.endsWith(".ass") || lowerSubPath.endsWith(".ssa"))) {
                 SubtitleAssetUtil.prepareAssWithSelectedFont(effectiveSubtitlePath, fontSelectedPath)
             } else {
@@ -1273,8 +1367,10 @@ fun PlayerScreen(
             return
         }
 
-        // VTT/SRT: use the app's normal subtitle appearance.
-        subView.visibility = View.VISIBLE
+        // VTT/SRT uses the lightweight custom overlay below. Media3 exposes only a
+        // fixed outline style, so using it here would make the user's border-width
+        // setting ineffective.
+        subView.visibility = View.INVISIBLE
         subView.setApplyEmbeddedStyles(isVttStyleEnabled)
         subView.setApplyEmbeddedFontSizes(isVttStyleEnabled)
 
@@ -1312,12 +1408,12 @@ fun PlayerScreen(
             android.graphics.Color.TRANSPARENT,
             CaptionStyleCompat.EDGE_TYPE_OUTLINE,
             vm.playerSettings.strokeColor,
-            if (isVttStyleEnabled) Typeface.DEFAULT_BOLD else (customTypeface ?: Typeface.DEFAULT_BOLD)
+            if (vttBold) Typeface.DEFAULT_BOLD else (customTypeface ?: Typeface.DEFAULT)
         )
         subView.setStyle(transparentStyle)
     }
 
-    LaunchedEffect(isInPictureInPicture, playerViewRef, subtitlesUrl, subtitleSizePercent, subtitleBottomPaddingFraction) {
+    LaunchedEffect(isInPictureInPicture, playerViewRef, subtitlesUrl, subtitleSizePercent, subtitleBottomPaddingFraction, vttBold, vttOutlineWidth) {
         playerViewRef?.let { applySubtitleSettingsToView(it) }
     }
 
@@ -1333,11 +1429,15 @@ fun PlayerScreen(
             streamUrl != null -> {
                 AndroidView(
                     factory = { ctx ->
-                        PlayerView(ctx).apply {
+                        KeyboardPlayerView(ctx).apply {
                             playerViewRef = this
                             player = forwardingPlayer
                             useController = !isPlayerLocked
                             controllerShowTimeoutMs = 2000
+                            isFocusable = true
+                            isFocusableInTouchMode = true
+                            seekSeconds = vm.playerSettings.doubleTapSeekSeconds
+                            requestFocus()
 
                             // Compose pointerInput으로 PlayerView 위를 덮지 않고 View 레벨에서 더블탭 seek 처리
                             // ExoPlayer Controller(재생바/버튼)의 터치를 유지한다.
@@ -1388,11 +1488,41 @@ fun PlayerScreen(
                     val settingsButton = playerView.findViewById<View>(androidx.media3.ui.R.id.exo_settings)
                     settingsButton?.visibility = View.GONE
                     playerView.player = forwardingPlayer
+                    (playerView as? KeyboardPlayerView)?.seekSeconds = vm.playerSettings.doubleTapSeekSeconds
                     playerView.useController = !isPlayerLocked
                         applySubtitleSettingsToView(playerView)
                     },
                     modifier = Modifier.fillMaxSize()
                 )
+
+                if (subtitlesUrl?.lowercase(Locale.ROOT)?.let { it.endsWith(".vtt") || it.endsWith(".srt") || it.contains(".vtt?") || it.contains(".srt?") } == true) {
+                    AndroidView(
+                        factory = { ctx ->
+                            VttStrokeTextView(ctx).apply {
+                                vttOverlayRef = this
+                                gravity = android.view.Gravity.BOTTOM or android.view.Gravity.CENTER_HORIZONTAL
+                                setTextColor(vm.playerSettings.textColor)
+                                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                                setPadding(12, 4, 12, 4)
+                                setLineSpacing(0f, 1.0f)
+                            }
+                        },
+                        update = { view ->
+                            vttOverlayRef = view
+                            view.text = vttCueText
+                            view.setTextColor(vm.playerSettings.textColor)
+                            view.typeface = if (vttBold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                            view.outlineWidthPx = vttOutlineWidth * context.resources.displayMetrics.density
+                            view.outlineColor = android.graphics.Color.BLACK
+                            val outlinePad = (view.outlineWidthPx + 6f).roundToInt()
+                            view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f * (subtitleSizePercent / 100f) * if (isInPictureInPicture) 0.48f else 1f)
+                            val bottom = (subtitleBottomPaddingFraction.coerceIn(0.03f, 0.45f) * 1000).toInt()
+                            view.setPadding(12 + outlinePad, 4 + outlinePad, 12 + outlinePad, if (view.height > 0) (view.height * subtitleBottomPaddingFraction.coerceIn(0.03f, 0.45f)).toInt() + outlinePad else 80 + outlinePad)
+                            view.invalidate()
+                        },
+                        modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp)
+                    )
+                }
             }
             !isOffline && !videoUrl.isNullOrBlank() -> {
                 StreamUrlExtractor(
@@ -1924,31 +2054,29 @@ fun PlayerScreen(
                                 Surface(
                                     modifier = Modifier.fillMaxWidth().clickable {
                                         pendingSeekPositionMs = exoPlayer.currentPosition
-                                        vm.updatePlayerSettings(context, vm.playerSettings.copy(subtitleFontPath = null, subtitleFontSource = null))
+                                        selectedSubtitleFontPath = null
+                                            if (subtitleSource == "kairan" || subtitleSource == "csora") {
+                                                SubtitleStore.clearSelectedFont(context, anime.id, subtitleSource)
+                                            }
                                     },
                                     shape = RoundedCornerShape(12.dp),
-                                    color = if (vm.playerSettings.subtitleFontPath == null) Lilac.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.04f)
+                                    color = if (selectedSubtitleFontPath == null) Lilac.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.04f)
                                 ) {
                                     Row(Modifier.padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        RadioButton(selected = vm.playerSettings.subtitleFontPath == null, onClick = null)
+                                        RadioButton(selected = selectedSubtitleFontPath == null, onClick = null)
                                         Spacer(Modifier.width(8.dp))
                                         Text("ASS 원본 폰트", color = Color.White, fontSize = 12.sp)
                                     }
                                 }
                                 Spacer(Modifier.height(5.dp))
                                 discoveredSubtitleFonts.forEach { font ->
-                                    val selected = vm.playerSettings.subtitleFontPath == font.path && vm.playerSettings.subtitleFontSource == font.source
+                                    val selected = selectedSubtitleFontPath == font.path && subtitleSource == font.source
                                     Surface(
                                         modifier = Modifier.fillMaxWidth().clickable {
                                             pendingSeekPositionMs = exoPlayer.currentPosition
-                                            vm.updatePlayerSettings(
-                                                context,
-                                                vm.playerSettings.copy(
-                                                    subtitleFontPath = font.path,
-                                                    subtitleFontSource = font.source,
-                                                    subtitleSourcePreference = font.source
-                                                )
-                                            )
+                                            selectedSubtitleFontPath = font.path
+                                            SubtitleStore.saveSelectedFont(context, anime.id, font.source, font.path)
+                                            subtitleSourcePreference = font.source
                                         },
                                         shape = RoundedCornerShape(12.dp),
                                         color = if (selected) Lilac.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.04f)
@@ -1970,6 +2098,109 @@ fun PlayerScreen(
                             Spacer(Modifier.height(10.dp))
                         }
 
+                        Spacer(Modifier.height(12.dp))
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    showSubtitleManager = !showSubtitleManager
+                                    if (!showSubtitleManager) {
+                                        scope.launch {
+                                            savedSubtitles = SubtitleStore.list(context, anime.id, currentEpisode.number)
+                                        }
+                                    }
+                                },
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color.White.copy(alpha = 0.05f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.FolderOpen, contentDescription = null, tint = Lilac)
+                                Spacer(Modifier.width(9.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text("이 에피소드의 저장 자막", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                    Text(
+                                        if (showSubtitleManager) "잘못된 자막은 삭제하거나 자동 선택에서 제외할 수 있습니다." else "저장된 Kairan/Csora/Linkkf 자막 관리",
+                                        color = Color.Gray, fontSize = 10.sp
+                                    )
+                                }
+                                Text(if (showSubtitleManager) "▲" else "▼", color = Color.Gray, fontSize = 12.sp)
+                            }
+                        }
+
+                        if (showSubtitleManager) {
+                            LaunchedEffect(anime.id, currentEpisode.number, showSubtitleManager) {
+                                if (showSubtitleManager) {
+                                    savedSubtitles = SubtitleStore.list(context, anime.id, currentEpisode.number)
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            if (savedSubtitles.isEmpty()) {
+                                Text("현재 저장된 자막이 없습니다.", color = Color.Gray, fontSize = 11.sp)
+                            } else {
+                                savedSubtitles.forEach { saved ->
+                                    val sourceName = when (saved.source) {
+                                        "kairan" -> "Kairan ASS"
+                                        "csora" -> "Csora ASS"
+                                        else -> "Linkkf VTT"
+                                    }
+                                    Surface(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = if (saved.ignored) Color.White.copy(alpha = 0.025f) else Color.White.copy(alpha = 0.045f)
+                                    ) {
+                                        Column(Modifier.padding(10.dp)) {
+                                            Text(sourceName, color = if (saved.ignored) Color.Gray else Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                            Text(
+                                                File(saved.path).name,
+                                                color = Color.Gray,
+                                                fontSize = 10.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            if (!saved.episodeMatch) {
+                                                Text("⚠ 회차 정보가 현재 에피소드와 일치하지 않음", color = Color(0xFFFFB74D), fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp))
+                                            } else if (saved.ignored) {
+                                                Text("자동 선택에서 제외됨", color = Color(0xFFFFB74D), fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp))
+                                            }
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(top = 5.dp),
+                                                horizontalArrangement = Arrangement.End,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                TextButton(onClick = {
+                                                    scope.launch {
+                                                        SubtitleStore.setIgnored(context, anime.id, currentEpisode.number, saved.source, !saved.ignored)
+                                                        savedSubtitles = SubtitleStore.list(context, anime.id, currentEpisode.number)
+                                                    }
+                                                }) {
+                                                    Text(if (saved.ignored) "다시 사용" else "사용 안 함", color = Lilac, fontSize = 11.sp)
+                                                }
+                                                TextButton(onClick = {
+                                                    scope.launch {
+                                                        val deletingCurrent = subtitlesUrl == saved.path
+                                                        SubtitleStore.delete(context, anime.id, currentEpisode.number, saved.source)
+                                                        savedSubtitles = SubtitleStore.list(context, anime.id, currentEpisode.number)
+                                                        if (deletingCurrent) {
+                                                            subtitlesUrl = null
+                                                            subtitleSource = "none"
+                                                            Toast.makeText(context, "자막을 삭제했습니다.", Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    }
+                                                }) {
+                                                    Text("삭제", color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Spacer(Modifier.height(5.dp))
+                                }
+                            }
+                        }
+
+                        Spacer(Modifier.height(12.dp))
                         Text("자막 설정", fontWeight = FontWeight.Bold, color = Color.White)
                         Spacer(Modifier.height(10.dp))
 
@@ -2008,6 +2239,36 @@ fun PlayerScreen(
                                 onCheckedChange = { isVttStyleEnabled = it }
                             )
                         }
+
+                        Spacer(Modifier.height(10.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("VTT 글자 굵게", fontSize = 13.sp)
+                            Switch(
+                                checked = vttBold,
+                                onCheckedChange = {
+                                    vttBold = it
+                                    vm.updatePlayerSettings(context, vm.playerSettings.copy(vttBold = it))
+                                }
+                            )
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+                        Text("VTT 테두리 두께 (${String.format(Locale.US, "%.1f", vttOutlineWidth)}dp)", fontSize = 13.sp)
+                        Slider(
+                            value = vttOutlineWidth,
+                            onValueChange = {
+                                vttOutlineWidth = it
+                                vm.updatePlayerSettings(context, vm.playerSettings.copy(vttOutlineWidth = it))
+                            },
+                            valueRange = 0.5f..6.0f,
+                            steps = 10
+                        )
+                        Text("기본값 2dp. 2dp에서는 Media3 기본 VTT 배치가 유지됩니다.", fontSize = 10.sp, color = Color.Gray)
 
                         Spacer(Modifier.height(10.dp))
 

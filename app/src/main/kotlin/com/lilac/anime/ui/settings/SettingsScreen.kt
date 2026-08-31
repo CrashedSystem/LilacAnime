@@ -103,6 +103,40 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(16.dp))
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("VTT 자막 굵게", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onBackground)
+                Switch(
+                    checked = settings.vttBold,
+                    onCheckedChange = { vm.updatePlayerSettings(context, settings.copy(vttBold = it)) }
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Text(
+                "VTT 자막 테두리 두께 (${String.format(java.util.Locale.US, "%.1f", settings.vttOutlineWidth)}dp)",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            Slider(
+                value = settings.vttOutlineWidth,
+                onValueChange = { vm.updatePlayerSettings(context, settings.copy(vttOutlineWidth = it)) },
+                valueRange = 0.5f..6.0f,
+                steps = 10
+            )
+            Text(
+                "2dp는 Media3 기본 VTT 배치를 사용하고, 다른 값에서는 사용자 지정 테두리를 적용합니다.",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f)
+            )
+
+            Spacer(Modifier.height(16.dp))
+
             Text(
                 "기본 VTT 자막 위치 (${(settings.subtitleBottomPaddingFraction * 100).toInt()}%)",
                 fontSize = 14.sp,
