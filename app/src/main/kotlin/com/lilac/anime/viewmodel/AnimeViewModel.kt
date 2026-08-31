@@ -3,7 +3,6 @@ package com.lilac.anime
 import kotlinx.coroutines.flow.update
 
 import android.content.Context
-import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -32,6 +31,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 class AnimeViewModel : ViewModel() {
@@ -82,6 +83,7 @@ class AnimeViewModel : ViewModel() {
         private set
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var connectivityManager: ConnectivityManager? = null
 
     init {
         startProgressTracking()
@@ -142,6 +144,7 @@ class AnimeViewModel : ViewModel() {
         if (networkCallback != null) return
         
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        connectivityManager = cm
         val activeNetwork = cm.activeNetwork
         val capabilities = cm.getNetworkCapabilities(activeNetwork)
         val isConnected = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
@@ -248,12 +251,25 @@ class AnimeViewModel : ViewModel() {
         
         viewModelScope.launch {
             try {
+                // 배치마다 allAnime을 전면 교체하면 카탈로그가 실시간으로 쌓이는 동안
+                // 이를 읽는 화면(검색/전체 목록)이 연쇄 recomposition되어 전역 버벅임이 생긴다.
+                // 중간 배치는 캐시(IO)에만 쌓고, allAnime 상태는 수집이 끝난 뒤 한 번만 갱신한다.
+                var finalList: List<Anime> = emptyList()
                 repository.getAllAnimeListFlow().collect { list ->
-                    allAnime = list
-                    list.forEach { animeCache[it.id] = it }
+                    finalList = list
+                    withContext(Dispatchers.IO) {
+                        list.forEach { animeCache[it.id] = it }
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    allAnime = finalList
                 }
                 isAllAnimeFullyLoaded = true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w("AnimeAll", "ALL_ANIME_LOAD_FAILED", e)
+                if (allAnime.isEmpty()) {
+                    error = e.message ?: "전체 목록을 불러오지 못했습니다."
+                }
             } finally {
                 isAllAnimeLoading = false
             }
@@ -457,11 +473,17 @@ class AnimeViewModel : ViewModel() {
         }
     }
 
+    private val librarySaveMutex = kotlinx.coroutines.sync.Mutex()
+
     fun toggleLibrary(context: Context, animeId: String) {
         library = if (animeId in library) library - animeId else library + animeId
-        val updated = library
         viewModelScope.launch(Dispatchers.IO) {
-            OfflineStore.saveLibrary(context, updated)
+            // 연속/빠른 토글 시에도 디스크에는 항상 최신 library 상태를 기록한다.
+            // 캡처 시점이 다른 여러 launch가 reorder돼도 락 안에서 현재 상태를
+            // 다시 읽어 마지막 상태가 최종 저장됨을 보장한다.
+            librarySaveMutex.withLock {
+                OfflineStore.saveLibrary(context, library)
+            }
         }
     }
 
@@ -489,22 +511,25 @@ class AnimeViewModel : ViewModel() {
     // 다운로드 취소 및 상태/파일 정리
 fun cancelDownload(context: Context, animeId: String, episodeNumber: Int) {
     val downloadKey = "${animeId}_${episodeNumber}"
-    
-    // 1. 진행 중인 서비스/Worker 작업 중단 요청
-    val intent = Intent(context, DownloadService::class.java).apply {
-        action = "ACTION_CANCEL_DOWNLOAD"
-        putExtra("EXTRA_ANIME_ID", animeId)
-        putExtra("EXTRA_EPISODE_NUMBER", episodeNumber)
-    }
-    context.startService(intent)
 
-    // 2. ViewModel 진행률 맵에서 제거
+    // 1. ViewModel 진행률 맵에서 제거
     _downloadProgressMap.update { currentMap ->
         currentMap - downloadKey
     }
     
-    // 3. DB 오프라인 데이터가 존재할 경우 제거
+    // 2. DB 오프라인 데이터 및 진행 중 다운로드 제거
+    //    (동시에 Media3 DownloadService.sendRemoveDownload로 진행 중/완료 작업 취소)
     deleteDownload(context, Anime(id = animeId, title = "", poster = "", backdrop = "", description = ""), episodeNumber)
+}
+
+override fun onCleared() {
+    super.onCleared()
+    // 등록된 네트워크 콜백을 해제해 ViewModel/콜백 누수를 막는다.
+    networkCallback?.let { cb ->
+        connectivityManager?.unregisterNetworkCallback(cb)
+    }
+    networkCallback = null
+    connectivityManager = null
 }
 }
 

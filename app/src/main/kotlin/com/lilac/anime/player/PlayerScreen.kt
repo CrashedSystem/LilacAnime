@@ -19,13 +19,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.tween
-import kotlinx.coroutines.Job
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -95,6 +88,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.awaitCancellation
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
@@ -416,7 +410,8 @@ fun PlayerScreen(
         uri?.let {
             try {
                 val inputStream = context.contentResolver.openInputStream(it)
-                val tempFile = File.createTempFile("custom_font", ".ttf", context.cacheDir)
+                // 고정 파일명으로 덮어써 임시 파일이 무한히 누적되지 않게 한다.
+                val tempFile = File(context.cacheDir, "custom_font.ttf")
                 FileOutputStream(tempFile).use { output -> inputStream?.copyTo(output) }
                 customTypeface = Typeface.createFromFile(tempFile)
                 customFontName = "커스텀 폰트 적용됨"
@@ -514,7 +509,7 @@ fun PlayerScreen(
     }
 
     var offlineEp by remember { mutableStateOf<Episode?>(null) }
-    LaunchedEffect(anime.id, currentEpisode.number) {
+    LaunchedEffect(anime.id, currentEpisode.number, currentEpisode.vttUrl) {
         offlineEp = OfflineStore.getEpisode(context, anime.id, currentEpisode.number)
     }
 
@@ -562,6 +557,10 @@ fun PlayerScreen(
             }
 
             onDispose {
+                // system UI 리스너 해제와 함께 화면 방향도 이 곳에서 복원한다.
+                // orientation 설정/해제를 하나의 DisposableEffect(activity)로
+                // 관리해 다른 effect와의 dispose 순서 경합으로 인한 방향 깜빡임을 없앤다.
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 @Suppress("DEPRECATION")
                 decorView.setOnSystemUiVisibilityChangeListener(null)
                 ViewCompat.setOnApplyWindowInsetsListener(decorView, null)
@@ -705,7 +704,7 @@ fun PlayerScreen(
         if (subtitleSourcePreference == "kairan") {
             val result = try {
                 withContext(Dispatchers.IO) {
-                    KairanSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                    KairanSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
                 }
             } catch (e: Exception) {
                 Log.w("Kairan", "SUBTITLE_SEARCH_FAILED episode=${currentEpisode.number}", e)
@@ -730,7 +729,7 @@ fun PlayerScreen(
             subtitlesUrl = null
             val result = try {
                 withContext(Dispatchers.IO) {
-                    CsoraSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                    CsoraSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
                 }
             } catch (e: Exception) {
                 Log.w("Csora", "SUBTITLE_SEARCH_FAILED episode=${currentEpisode.number}", e)
@@ -762,7 +761,7 @@ fun PlayerScreen(
 
         val result = try {
             withContext(Dispatchers.IO) {
-                KairanSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                KairanSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
             }
         } catch (e: Exception) {
             Log.w("Kairan", "BACKGROUND_ASS_SEARCH_FAILED episode=${currentEpisode.number}", e)
@@ -795,7 +794,7 @@ fun PlayerScreen(
 
         val result = try {
             withContext(Dispatchers.IO) {
-                CsoraSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                CsoraSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
             }
         } catch (e: Exception) {
             Log.w("Csora", "BACKGROUND_ASS_SEARCH_FAILED episode=${currentEpisode.number}", e)
@@ -934,10 +933,10 @@ fun PlayerScreen(
         }
     }
 
-    // PlayerScreen이 실제로 종료될 때만 화면 방향과 시스템 바를 복원한다.
+    // PlayerScreen이 실제로 종료될 때만 시스템 바를 복원한다.
+    // (화면 방향 복원은 위 시스템 UI DisposableEffect의 onDispose에서 담당)
     DisposableEffect(activity) {
         onDispose {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             activity?.window?.let { window ->
                 WindowCompat.getInsetsController(
                     window,
@@ -952,7 +951,9 @@ fun PlayerScreen(
     // ExoPlayer lifecycle은 화면 방향과 분리해서 관리한다.
     DisposableEffect(exoPlayer) {
         onDispose {
-            exoPlayer.release()
+            runCatching { exoPlayer.release() }.onFailure {
+                Log.d("Subtitle", "EXOPLAYER_RELEASE_FAILED", it)
+            }
         }
     }
 
@@ -1052,7 +1053,7 @@ fun PlayerScreen(
                     )
             }
             val cacheDataSourceFactory = CacheDataSource.Factory()
-                .setCache(LilacApplication.downloadCache)
+                .setCache(LilacApplication.streamingCache)
                 .setUpstreamDataSourceFactory(upstreamFactory)
                 .setCacheReadDataSourceFactory(FileDataSource.Factory())
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
@@ -1181,9 +1182,15 @@ fun PlayerScreen(
         }
         exoPlayer.addListener(listener)
 
-        exoPlayer.setMediaSource(mediaSourceFactory.createMediaSource(mediaItemBuilder.build()))
-        exoPlayer.prepare()
-        exoPlayer.playWhenReady = true
+        try {
+            exoPlayer.setMediaSource(mediaSourceFactory.createMediaSource(mediaItemBuilder.build()))
+            exoPlayer.prepare()
+            exoPlayer.playWhenReady = true
+
+            awaitCancellation()
+        } finally {
+            runCatching { exoPlayer.removeListener(listener) }
+        }
     }
 
     LaunchedEffect(streamUrl, currentEpisode.number) {
@@ -1559,66 +1566,9 @@ fun PlayerScreen(
             }
         }
 
-        // 좌/우 더블 탭으로 사용자가 설정한 시간만큼 뒤로/앞으로 이동한다.
-        // 연속 더블 탭은 누적 시간을 표시하고, 물결 애니메이션으로 피드백을 준다.
-        if (!isPlayerLocked) {
-            var playerWidth by remember { mutableIntStateOf(0) }
-            var seekFeedbackDirection by remember { mutableIntStateOf(0) } // -1: 뒤로, +1: 앞으로
-            var seekFeedbackSeconds by remember { mutableIntStateOf(0) }
-            var showSeekFeedback by remember { mutableStateOf(false) }
-            val seekRipple = remember { Animatable(0f) }
-            val seekScope = rememberCoroutineScope()
-            var seekFeedbackJob by remember { mutableStateOf<Job?>(null) }
-
-            Box(
-                modifier = Modifier
-                    // 영상 영역만 더블탭을 처리하고 하단 PlayerView 컨트롤/재생바는 그대로 터치를 받는다.
-                    .fillMaxSize()
-                    .padding(bottom = 90.dp)
-                    .onSizeChanged { playerWidth = it.width }
-            ) {
-                // YouTube처럼 아이콘 없이 화면 좌/우에서 반원형 오버레이가 짧게 퍼진다.
-                if (showSeekFeedback && seekFeedbackDirection != 0) {
-                    val feedbackAlignment = if (seekFeedbackDirection < 0) {
-                        Alignment.CenterStart
-                    } else {
-                        Alignment.CenterEnd
-                    }
-
-                    // Animatable 값에 따라 화면 바깥쪽에서 큰 원이 퍼져 들어오는 느낌을 만든다.
-                    val rippleScale = 0.55f + seekRipple.value * 0.85f
-                    val rippleAlpha = (1f - seekRipple.value * 0.35f).coerceIn(0f, 1f)
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize(),
-                        contentAlignment = feedbackAlignment
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(520.dp)
-                                .scale(rippleScale)
-                                .alpha(0.32f * rippleAlpha)
-                                .background(Color.Black, CircleShape)
-                        )
-
-                        // YouTube 스타일처럼 숫자만 간단히 표시한다.
-                        Text(
-                            text = "${seekFeedbackSeconds}초",
-                            modifier = Modifier
-                                .align(
-                                    if (seekFeedbackDirection < 0) Alignment.CenterStart
-                                    else Alignment.CenterEnd
-                                )
-                                .padding(horizontal = 72.dp),
-                            color = Color.White,
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 18.sp
-                        )
-                    }
-                }
-            }
-        }
+        // 좌/우 더블 탭 seek는 View 레벨 GestureDetector(line: onDoubleTap)에서 처리한다.
+        // 기존에는 데드 상태 변수(Animatable 물결 피드백)만 선언되고 값이 한 번도
+        // 설정되지 않아 실제로 표시되지 않는 무효 UI였으므로 제거해 리컴포지션 부담을 줄인다.
 
         // PlayerView controller는 표시 상태가 바뀔 때마다 별도의 타이머로 숨긴다.
         // 기존처럼 playerViewRef만 key로 사용하면 controller가 다시 나타난 뒤
@@ -1662,15 +1612,11 @@ fun PlayerScreen(
         }
 
         // 우측 하단에 6초간 표시되는 Csora ASS 전환 안내.
-        AnimatedVisibility(
-            visible = showCsoraAssPrompt && !isPlayerLocked,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp),
-            enter = fadeIn(),
-            exit = fadeOut()
-        ) {
+        if (showCsoraAssPrompt && !isPlayerLocked) {
             Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp),
                 shape = RoundedCornerShape(14.dp),
                 tonalElevation = 6.dp,
                 shadowElevation = 8.dp
@@ -1708,15 +1654,11 @@ fun PlayerScreen(
         }
 
         // 우측 하단에 6초간 표시되는 Kairan ASS 전환 안내.
-        AnimatedVisibility(
-            visible = showKairanAssPrompt && !isPlayerLocked,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp),
-            enter = fadeIn(),
-            exit = fadeOut()
-        ) {
+        if (showKairanAssPrompt && !isPlayerLocked) {
             Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp),
                 shape = RoundedCornerShape(14.dp),
                 tonalElevation = 6.dp,
                 shadowElevation = 8.dp
@@ -1753,15 +1695,11 @@ fun PlayerScreen(
             }
         }
 
-        AnimatedVisibility(
-            visible = (isControlsVisible || showPlayerSettingsDialog) && !isPlayerLocked,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier.align(Alignment.TopCenter)
-        ) {
+        if ((isControlsVisible || showPlayerSettingsDialog) && !isPlayerLocked) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .align(Alignment.TopCenter)
                     .padding(top = 12.dp, start = 12.dp, end = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.Top
@@ -2056,7 +1994,7 @@ fun PlayerScreen(
                                         pendingSeekPositionMs = exoPlayer.currentPosition
                                         selectedSubtitleFontPath = null
                                             if (subtitleSource == "kairan" || subtitleSource == "csora") {
-                                                SubtitleStore.clearSelectedFont(context, anime.id, subtitleSource)
+                                                scope.launch { SubtitleStore.clearSelectedFont(context, anime.id, subtitleSource) }
                                             }
                                     },
                                     shape = RoundedCornerShape(12.dp),
@@ -2075,7 +2013,7 @@ fun PlayerScreen(
                                         modifier = Modifier.fillMaxWidth().clickable {
                                             pendingSeekPositionMs = exoPlayer.currentPosition
                                             selectedSubtitleFontPath = font.path
-                                            SubtitleStore.saveSelectedFont(context, anime.id, font.source, font.path)
+                                            scope.launch { SubtitleStore.saveSelectedFont(context, anime.id, font.source, font.path) }
                                             subtitleSourcePreference = font.source
                                         },
                                         shape = RoundedCornerShape(12.dp),

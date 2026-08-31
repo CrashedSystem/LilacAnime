@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
 import com.lilac.anime.data.*
+import com.lilac.anime.data.matcher.AnimeTitleMatcher
 
 @Composable
 fun SearchScreen(
@@ -54,8 +55,16 @@ fun SearchScreen(
 
             Spacer(Modifier.height(20.dp))
 
-            val results = searchList.filter {
-                query.isBlank() || it.title.contains(query, true) || it.genres.any { genre -> genre.contains(query, true) }
+            val results = remember(query, searchList) {
+                val q = query.trim()
+                if (q.isEmpty()) {
+                    searchList
+                } else {
+                    searchList.filter {
+                        AnimeTitleMatcher.matches(it.title, q) ||
+                            it.genres.any { genre -> genre.contains(q, true) }
+                    }
+                }
             }
 
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {

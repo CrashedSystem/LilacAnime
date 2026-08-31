@@ -37,9 +37,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -121,7 +118,6 @@ import io.github.peerless2012.ass.media.parser.AssSubtitleParserFactory
 import io.github.peerless2012.ass.media.type.AssRenderType
 import io.github.peerless2012.ass.media.widget.AssSubtitleView
 import com.lilac.anime.data.*
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -219,6 +215,9 @@ class MainActivity : ComponentActivity() {
                         packageManager.canRequestPackageInstalls()
                 )
             }
+
+            // Compose 생명주기에 묶인 스코프. 업데이트 다운로드가 화면 퇴장 시 취소된다.
+            val updateScope = rememberCoroutineScope()
 
             LaunchedEffect(Unit) {
                 refreshInstallPermission = {
@@ -336,9 +335,7 @@ class MainActivity : ComponentActivity() {
                                         installPermissionGranted = true
                                         updateBusy = true
 
-                                        CoroutineScope(
-                                            Dispatchers.Main
-                                        ).launch {
+                                        updateScope.launch {
                                             try {
                                                 val apk =
                                                     GithubReleaseChecker

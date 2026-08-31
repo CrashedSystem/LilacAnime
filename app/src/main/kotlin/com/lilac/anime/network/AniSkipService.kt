@@ -25,6 +25,43 @@ object AniSkipService {
 
     private val ANISKIP_TYPES = setOf("op", "ed", "mixed-op", "mixed-ed")
 
+    // MAL ID는 작품별로 고정이므로 타이틀별로 캐싱해 동일 작품의
+    // 에피소드 전환 시 8+회의 중복 HTTP 요청을 피한다. 실패(null)도 캐싱해
+    // 동일 타이틀에 대한 재시도 폭주를 막는다.
+    private val malIdCache = java.util.concurrent.ConcurrentHashMap<String, Int?>()
+
+    // Cached regex patterns to avoid recompilation on every call
+    private val RE_SQUARE_BRACKETS = Regex("\\[[^]]*]")
+    private val RE_PARENS = Regex("\\([^)]*\\)")
+    private val RE_WHITESPACE = Regex("\\s+")
+    private val RE_ENGLISH_WORD = Regex("[A-Za-z][A-Za-z0-9À-ÿ''\u2019:&.,!? -]{3,}")
+    private val RE_ANIME_TITLE_PREFIX = Regex(
+        "(?i)(?:anime|title)?\\s*[:：]\\s*([A-Za-z][A-Za-z0-9''\u2019:&.,!? -]{3,})"
+    )
+    private val RE_SEASONLESS = Regex(
+        "(?i)(?:\\b(?:season|part|cour|"
+            + "season\\s*[0-9]+|part\\s*[0-9]+)"
+            + "\\b|\\b\\d+\\s*(?:st|nd|rd|th)"
+            + "\\s+season\\b|\\b\\d+기\\b|"
+            + "\\b시즌\\s*\\d+\\b|\\b제\\s*\\d+\\s*기\\b|"
+            + "\\b第\\s*\\d+\\s*期\\b|\\b第\\s*\\d+\\s*季\\b)"
+    )
+    private val RE_NON_UNICODE = Regex("[^\\p{L}\\p{N}]+")
+
+    private val SEASON_PATTERNS = listOf(
+        Regex("(?i)\\b(?:season|part|cour)\\s*(\\d+)\\b"),
+        Regex("(?i)\\b(\\d+)(?:st|nd|rd|th)\\s+season\\b"),
+        Regex("(?i)\\b(\\d+)\\s*기\\b"),
+        Regex("(?i)\\b시즌\\s*(\\d+)\\b"),
+        Regex("(?i)\\b제\\s*(\\d+)\\s*기\\b"),
+        Regex("(?i)\\b第\\s*(\\d+)\\s*期\\b"),
+        Regex("(?i)\\b第\\s*(\\d+)\\s*季\\b")
+    )
+
+    private val SEASON_NUMBER_PATTERNS = SEASON_PATTERNS + Regex("(?i)\\bS(\\d+)\\b")
+
+    private val RE_HTML_TAG = Regex("<[^>]+>")
+
     private data class MalCandidate(
         val malId: Int,
         val score: Int,
@@ -313,8 +350,8 @@ object AniSkipService {
                     .replace("&amp;", "&")
                     .replace("&lt;", "<")
                     .replace("&gt;", ">")
-                    .replace(Regex("<[^>]+>"), " ")
-                    .replace(Regex("\\s+"), " ")
+                    .replace(RE_HTML_TAG, " ")
+                    .replace(RE_WHITESPACE, " ")
                     .trim()
 
                 Log.d(
@@ -348,7 +385,16 @@ object AniSkipService {
         return null
     }
 
-    private fun findMalId(title: String): Int? {
+    fun findMalId(title: String): Int? {
+        // ConcurrentHashMap은 null 저장을 허용하지 않으므로 명시적으로 조회/저장해
+        // 실패(null) 결과도 재사용해 이후 중복 요청을 막는다.
+        malIdCache[title]?.let { return it }
+        val result = findMalIdUncached(title)
+        malIdCache[title] = result
+        return result
+    }
+
+    private fun findMalIdUncached(title: String): Int? {
         val requestedSeason = extractRequestedSeason(title)
         val titleCandidates = buildTitleCandidates(title)
         val original = titleCandidates.firstOrNull().orEmpty()
@@ -1393,6 +1439,10 @@ object AniSkipService {
                 if (
                     connection.responseCode !in 200..299
                 ) {
+                    // error stream을 소비해 연결이 지연 재사용되지 않게 한다.
+                    runCatching {
+                        connection.errorStream?.bufferedReader()?.use { it.readText() }
+                    }
                     return null
                 }
 
@@ -1475,18 +1525,9 @@ object AniSkipService {
     ): List<String> {
         val cleaned =
             title
-                .replace(
-                    Regex("\\[[^]]*]"),
-                    " "
-                )
-                .replace(
-                    Regex("\\([^)]*\\)"),
-                    " "
-                )
-                .replace(
-                    Regex("\\s+"),
-                    " "
-                )
+                .replace(RE_SQUARE_BRACKETS, " ")
+                .replace(RE_PARENS, " ")
+                .replace(RE_WHITESPACE, " ")
                 .trim()
 
         val candidates =
@@ -1495,10 +1536,7 @@ object AniSkipService {
         fun addCandidate(value: String) {
             val candidate =
                 value
-                    .replace(
-                        Regex("\\s+"),
-                        " "
-                    )
+                    .replace(RE_WHITESPACE, " ")
                     .trim()
 
             if (
@@ -1512,21 +1550,8 @@ object AniSkipService {
 
         val seasonless =
             cleaned
-                .replace(
-                    Regex(
-                        "(?i)(?:\\b(?:season|part|cour|"
-                            + "season\\s*[0-9]+|part\\s*[0-9]+)"
-                            + "\\b|\\b\\d+\\s*(?:st|nd|rd|th)"
-                            + "\\s+season\\b|\\b\\d+기\\b|"
-                            + "\\b시즌\\s*\\d+\\b|\\b제\\s*\\d+\\s*기\\b|"
-                            + "\\b第\\s*\\d+\\s*期\\b|\\b第\\s*\\d+\\s*季\\b)"
-                    ),
-                    " "
-                )
-                .replace(
-                    Regex("\\s+"),
-                    " "
-                )
+                .replace(RE_SEASONLESS, " ")
+                .replace(RE_WHITESPACE, " ")
                 .trim()
 
         addCandidate(seasonless)
@@ -1539,9 +1564,7 @@ object AniSkipService {
             cleaned.substringBefore(" | ")
         )
 
-        Regex(
-            "[A-Za-z][A-Za-z0-9À-ÿ'’:&.,!? -]{3,}"
-        )
+        RE_ENGLISH_WORD
             .findAll(cleaned)
             .map {
                 it.value.trim()
@@ -1553,10 +1576,7 @@ object AniSkipService {
                 addCandidate(it)
             }
 
-        Regex(
-            "(?i)(?:anime|title)?\\s*[:：]\\s*"
-                + "([A-Za-z][A-Za-z0-9'’:&.,!? -]{3,})"
-        )
+        RE_ANIME_TITLE_PREFIX
             .find(cleaned)
             ?.groupValues
             ?.getOrNull(1)
@@ -1568,32 +1588,7 @@ object AniSkipService {
     private fun extractRequestedSeason(
         title: String
     ): Int? {
-        val patterns =
-            listOf(
-                Regex(
-                    "(?i)\\b(?:season|part|cour)\\s*(\\d+)\\b"
-                ),
-                Regex(
-                    "(?i)\\b(\\d+)(?:st|nd|rd|th)\\s+season\\b"
-                ),
-                Regex(
-                    "(?i)\\b(\\d+)\\s*기\\b"
-                ),
-                Regex(
-                    "(?i)\\b시즌\\s*(\\d+)\\b"
-                ),
-                Regex(
-                    "(?i)\\b제\\s*(\\d+)\\s*기\\b"
-                ),
-                Regex(
-                    "(?i)\\b第\\s*(\\d+)\\s*期\\b"
-                ),
-                Regex(
-                    "(?i)\\b第\\s*(\\d+)\\s*季\\b"
-                )
-            )
-
-        for (pattern in patterns) {
+        for (pattern in SEASON_PATTERNS) {
             pattern.find(title)
                 ?.groupValues
                 ?.getOrNull(1)
@@ -1607,38 +1602,7 @@ object AniSkipService {
     private fun extractSeasonNumber(
         value: String
     ): Int? {
-        val patterns =
-            listOf(
-                Regex(
-                    "(?i)\\bseason\\s*(\\d+)\\b"
-                ),
-                Regex(
-                    "(?i)\\bpart\\s*(\\d+)\\b"
-                ),
-                Regex(
-                    "(?i)\\b(\\d+)(?:st|nd|rd|th)\\s+season\\b"
-                ),
-                Regex(
-                    "(?i)\\b(\\d+)\\s*기\\b"
-                ),
-                Regex(
-                    "(?i)\\b시즌\\s*(\\d+)\\b"
-                ),
-                Regex(
-                    "(?i)\\b제\\s*(\\d+)\\s*기\\b"
-                ),
-                Regex(
-                    "(?i)\\b第\\s*(\\d+)\\s*期\\b"
-                ),
-                Regex(
-                    "(?i)\\b第\\s*(\\d+)\\s*季\\b"
-                ),
-                Regex(
-                    "(?i)\\bS(\\d+)\\b"
-                )
-            )
-
-        for (pattern in patterns) {
+        for (pattern in SEASON_NUMBER_PATTERNS) {
             pattern.find(value)
                 ?.groupValues
                 ?.getOrNull(1)
@@ -1654,22 +1618,10 @@ object AniSkipService {
     ): String =
         value
             .lowercase(Locale.ROOT)
-            .replace(
-                Regex("\\[[^]]*]"),
-                " "
-            )
-            .replace(
-                Regex("\\([^)]*\\)"),
-                " "
-            )
-            .replace(
-                Regex("[^\\p{L}\\p{N}]+"),
-                " "
-            )
-            .replace(
-                Regex("\\s+"),
-                " "
-            )
+            .replace(RE_SQUARE_BRACKETS, " ")
+            .replace(RE_PARENS, " ")
+            .replace(RE_NON_UNICODE, " ")
+            .replace(RE_WHITESPACE, " ")
             .trim()
 
     private fun compareTitles(

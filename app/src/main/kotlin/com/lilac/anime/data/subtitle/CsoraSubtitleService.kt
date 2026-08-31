@@ -32,10 +32,11 @@ object CsoraSubtitleService {
 
     suspend fun findSubtitle(
         context: Context,
+        animeId: String,
         title: String,
         episodeNumber: Int
     ): KairanSubtitleResult? = withContext(Dispatchers.IO) {
-        val cachedSubtitle = SubtitleStore.get(context, titleKey(title), episodeNumber, "csora")
+        val cachedSubtitle = SubtitleStore.get(context, animeId, episodeNumber, "csora")
         val fontDir = File(context.filesDir, "$CACHE_DIR/${titleKey(title)}/fonts")
         val hasCachedFonts = fontDir.listFiles()?.any { file ->
             file.isFile && file.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc")
@@ -86,7 +87,7 @@ object CsoraSubtitleService {
             }
             candidates.filter { it !in episodeValidCandidates }.forEach { File(it.path).delete() }
             if (selected != null) {
-                SubtitleStore.save(context, titleKey(title), episodeNumber, "csora", selected)
+                SubtitleStore.save(context, animeId, episodeNumber, "csora", selected)
                 prefs.edit().putInt("asset_version:${titleKey(title)}#$episodeNumber", ASSET_SCHEMA_VERSION).apply()
                 return@withContext KairanSubtitleResult.DirectFile(selected)
             }

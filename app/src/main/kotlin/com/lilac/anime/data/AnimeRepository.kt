@@ -55,16 +55,23 @@ class AnimeRepository {
                 }.awaitAll().sortedBy { it.first }
             }
 
+            var addedNew = false
             for ((_, animeList) in pageResults) {
                 if (animeList.isEmpty()) {
-                    // 애니가 하나도 없는 페이지가 나오면 즉시 탐색 종료
                     shouldStop = true
                     break
                 } else {
-                    animeList.forEach { anime ->
-                        result[anime.id] = anime
+                    for (anime in animeList) {
+                        if (anime.id !in result) {
+                            result[anime.id] = anime
+                            addedNew = true
+                        }
                     }
                 }
+            }
+
+            if (!addedNew && result.isNotEmpty()) {
+                shouldStop = true
             }
 
             if (result.isNotEmpty()) {
