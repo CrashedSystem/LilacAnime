@@ -24,6 +24,9 @@ data class PlayerSettings(
     // 자막 소스: "linkkf" = Linkkf VTT, "kairan" = Kairan ASS, "csora" = Csora ASS
     val subtitleSourcePreference: String = "linkkf",
     val customFontPath: String? = null,
+    // Discovered Kairan/Csora ASS font selected by the user.
+    val subtitleFontPath: String? = null,
+    val subtitleFontSource: String? = null,
     val showAniSkipButton: Boolean = true,
     // 좌/우 더블 탭 시 이동할 시간(초)
     val doubleTapSeekSeconds: Int = 10,

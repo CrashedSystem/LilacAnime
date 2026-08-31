@@ -16,19 +16,28 @@ object KairanBlogRepository {
     private const val CACHE_FILE = "kairan_blog_index.json"
     private const val CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L
     private const val PAGE_SIZE = 150
+    private const val CACHE_VERSION_PREFS = "kairan_index_meta"
+    private const val CACHE_VERSION = 2
 
     suspend fun getPosts(context: Context): List<KairanPost> = withContext(Dispatchers.IO) {
         val cache = cacheFile(context)
         val cached = loadCache(cache)
         val freshEnough = cache.exists() && System.currentTimeMillis() - cache.lastModified() < CACHE_MAX_AGE_MS
-        if (cached.isNotEmpty() && freshEnough) {
-            Log.d(TAG, "INDEX_CACHE_HIT count=${cached.size}")
+        val cacheVersion = context.getSharedPreferences(CACHE_VERSION_PREFS, Context.MODE_PRIVATE)
+            .getInt("version", 0)
+        if (cached.isNotEmpty() && freshEnough && cacheVersion == CACHE_VERSION) {
+            Log.d(TAG, "INDEX_CACHE_HIT count=${cached.size} version=$cacheVersion")
             return@withContext cached
+        }
+        if (cached.isNotEmpty()) {
+            Log.d(TAG, "INDEX_CACHE_REFRESH_REQUIRED count=${cached.size} version=$cacheVersion")
         }
         try {
             val downloaded = downloadAllPosts()
             if (downloaded.isNotEmpty()) {
                 saveCache(cache, downloaded)
+                context.getSharedPreferences(CACHE_VERSION_PREFS, Context.MODE_PRIVATE)
+                    .edit().putInt("version", CACHE_VERSION).apply()
                 return@withContext downloaded
             }
         } catch (e: Exception) {
@@ -39,34 +48,55 @@ object KairanBlogRepository {
 
     suspend fun refresh(context: Context): List<KairanPost> = withContext(Dispatchers.IO) {
         val posts = downloadAllPosts()
-        if (posts.isNotEmpty()) saveCache(cacheFile(context), posts)
+        if (posts.isNotEmpty()) {
+            saveCache(cacheFile(context), posts)
+            context.getSharedPreferences(CACHE_VERSION_PREFS, Context.MODE_PRIVATE)
+                .edit().putInt("version", CACHE_VERSION).apply()
+        }
         posts
     }
 
     private fun cacheFile(context: Context) = File(context.filesDir, CACHE_FILE)
 
+    private data class BlogPage(
+        val posts: List<KairanPost>,
+        val totalResults: Int?
+    )
+
     private fun downloadAllPosts(): List<KairanPost> {
         val out = LinkedHashMap<String, KairanPost>()
         var startIndex = 1
+        var totalResults: Int? = null
+
         while (true) {
             val page = downloadPage(startIndex)
-            if (page.isEmpty()) break
-            page.forEach { out[it.url] = it }
-            Log.d(TAG, "INDEX_PAGE start=$startIndex count=${page.size}")
-            // Blogger feed may return fewer items than requested even when more posts exist.
-            // Do not stop here; stop only when the feed is empty.
-            if (page.size == 0) break
-            startIndex += page.size
+            if (page.posts.isEmpty()) break
+
+            page.posts.forEach { out[it.url] = it }
+            totalResults = page.totalResults ?: totalResults
+            Log.d(TAG, "INDEX_PAGE start=$startIndex count=${page.posts.size} total=${totalResults ?: -1}")
+
+            val nextStart = startIndex + page.posts.size
+            if (totalResults != null && nextStart > totalResults!!) break
+            if (page.posts.size < PAGE_SIZE && totalResults == null) break
+            if (nextStart <= startIndex) break
+            startIndex = nextStart
         }
-        Log.d(TAG, "INDEX_COMPLETE count=${out.size}")
+
+        Log.d(TAG, "INDEX_COMPLETE count=${out.size} total=${totalResults ?: -1}")
         return out.values.toList()
     }
 
-    private fun downloadPage(startIndex: Int): List<KairanPost> {
+    private fun downloadPage(startIndex: Int): BlogPage {
         val url = "$BLOG_URL/feeds/posts/default?alt=json&max-results=$PAGE_SIZE&start-index=$startIndex"
         val text = getText(url)
-        val entries = JSONObject(text).optJSONObject("feed")?.optJSONArray("entry") ?: return emptyList()
-        return buildList {
+        val feed = JSONObject(text).optJSONObject("feed") ?: return BlogPage(emptyList(), null)
+        val totalResults = feed.optJSONObject("openSearch\$totalResults")
+            ?.optString("\$t")
+            ?.toIntOrNull()
+        val entries = feed.optJSONArray("entry") ?: return BlogPage(emptyList(), totalResults)
+
+        val posts = buildList {
             for (i in 0 until entries.length()) {
                 val entry = entries.optJSONObject(i) ?: continue
                 val title = entry.optJSONObject("title")?.optString("\$t")?.trim().orEmpty()
@@ -79,9 +109,12 @@ object KairanBlogRepository {
                         if (postUrl != null) break
                     }
                 }
-                if (title.isNotBlank() && postUrl != null) add(KairanPost(title, postUrl))
+                if (title.isNotBlank() && postUrl != null) {
+                    add(KairanPost(title, postUrl))
+                }
             }
         }
+        return BlogPage(posts, totalResults)
     }
 
     private fun getText(urlString: String): String {

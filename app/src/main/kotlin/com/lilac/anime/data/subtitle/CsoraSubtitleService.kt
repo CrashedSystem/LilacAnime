@@ -3,6 +3,7 @@ package com.lilac.anime
 import android.content.Context
 import android.util.Log
 import com.lilac.anime.data.subtitle.KairanSubtitleResult
+import com.lilac.anime.data.subtitle.SubtitleAssetUtil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -25,6 +26,7 @@ object CsoraSubtitleService {
     private const val PREF = "csora_post_cache"
     private const val UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
     private const val MIN_TITLE_SIMILARITY = 0.52
+    private const val ASSET_SCHEMA_VERSION = 2
 
     private data class DownloadLink(val label: String, val url: String)
 
@@ -38,10 +40,11 @@ object CsoraSubtitleService {
         val hasCachedFonts = fontDir.listFiles()?.any { file ->
             file.isFile && file.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc")
         } == true
+        val prefs = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+        val cacheVersion = prefs.getInt("asset_version:${titleKey(title)}#$episodeNumber", 0)
 
-        // Keep cached subtitles fast, but if this is an older cached Csora subtitle
-        // without fonts, revisit the post once so separate font links can be fetched.
-        if (cachedSubtitle != null && hasCachedFonts) {
+        // Keep cached subtitles fast only after the multi-ASS/font asset pass has run.
+        if (cachedSubtitle != null && hasCachedFonts && cacheVersion == ASSET_SCHEMA_VERSION) {
             return@withContext KairanSubtitleResult.DirectFile(cachedSubtitle)
         }
 
@@ -60,13 +63,27 @@ object CsoraSubtitleService {
             return@withContext KairanSubtitleResult.DirectFile(cachedSubtitle)
         }
 
+        val candidates = mutableListOf<SubtitleAssetUtil.AssCandidate>()
         for (link in links) {
-            val result = downloadAndExtract(context, link.url, title, episodeNumber)
-            if (result != null) {
-                // Some Csora posts provide fonts separately from the subtitle ZIP.
-                // Font failures must never discard an otherwise valid subtitle.
-                downloadFontLinks(context, fontLinks, title)
-                return@withContext KairanSubtitleResult.DirectFile(result)
+            val results = downloadAndExtract(context, link.url, title, episodeNumber)
+            results.forEach { path ->
+                candidates += SubtitleAssetUtil.AssCandidate(path, "csora", 2)
+                Log.d(TAG, "SUBTITLE_CANDIDATE path=$path label=${link.label}")
+            }
+        }
+        if (candidates.isNotEmpty()) {
+            // Some Csora posts provide fonts separately from the subtitle ZIP.
+            // Font failures must never discard an otherwise valid subtitle.
+            downloadFontLinks(context, fontLinks, title)
+            val selected = if (candidates.all { it.path.endsWith(".ass", true) || it.path.endsWith(".ssa", true) }) {
+                SubtitleAssetUtil.resolveAssCandidates(context, title, episodeNumber, candidates)
+            } else {
+                candidates.first().path
+            }
+            if (selected != null) {
+                SubtitleStore.save(context, titleKey(title), episodeNumber, "csora", selected)
+                prefs.edit().putInt("asset_version:${titleKey(title)}#$episodeNumber", ASSET_SCHEMA_VERSION).apply()
+                return@withContext KairanSubtitleResult.DirectFile(selected)
             }
         }
         null
@@ -172,7 +189,7 @@ object CsoraSubtitleService {
             l.endsWith(".ass") || l.endsWith(".ssa") || l.endsWith(".zip")
     }
 
-    private suspend fun downloadAndExtract(context: Context, originalUrl: String, title: String, episode: Int): String? {
+    private suspend fun downloadAndExtract(context: Context, originalUrl: String, title: String, episode: Int): List<String> {
         val dir = File(context.filesDir, "$CACHE_DIR/${titleKey(title)}").apply { mkdirs() }
         val tmp = File(dir, "download_${System.currentTimeMillis()}.bin")
         try {
@@ -180,35 +197,28 @@ object CsoraSubtitleService {
             if (!downloaded || tmp.length() < 32 || looksLikeHtml(tmp)) {
                 Log.w(TAG, "DOWNLOAD_NOT_FILE url=$originalUrl size=${tmp.length()}")
                 tmp.delete()
-                return null
+                return emptyList()
             }
 
             val selected = when {
                 isZip(tmp) -> extractZip(dir, tmp, episode)
-                isAss(tmp) -> File(dir, "episode_${episode}.ass").also { tmp.copyTo(it, overwrite = true) }
+                isAss(tmp) -> listOf(File(dir, "episode_${episode}_${System.currentTimeMillis()}.ass").also { tmp.copyTo(it, overwrite = true) }.absolutePath)
                 isVttOrSrt(tmp) -> {
                     val extension = detectTextSubtitleExtension(tmp)
-                    File(dir, "episode_${episode}.$extension").also { tmp.copyTo(it, overwrite = true) }
+                    listOf(File(dir, "episode_${episode}_${System.currentTimeMillis()}.$extension").also { tmp.copyTo(it, overwrite = true) }.absolutePath)
                 }
                 else -> {
                     Log.w(TAG, "UNSUPPORTED_MAGIC magic=${fileMagic(tmp)} size=${tmp.length()} url=$originalUrl")
-                    null
+                    emptyList()
                 }
             }
             tmp.delete()
-
-            if (selected != null) {
-                SubtitleStore.save(context, titleKey(title), episode, "csora", selected.absolutePath)
-                Log.d(TAG, "SUBTITLE_SAVED path=${selected.absolutePath}")
-                return selected.absolutePath
-            }
-
-            Log.w(TAG, "UNSUPPORTED_DOWNLOAD url=$originalUrl")
-            return null
+            if (selected.isNotEmpty()) Log.d(TAG, "SUBTITLE_ASSETS_FOUND count=${selected.size} url=$originalUrl")
+            return selected
         } catch (e: Exception) {
             Log.w(TAG, "DOWNLOAD_FAILED url=$originalUrl", e)
             tmp.delete()
-            return null
+            return emptyList()
         }
     }
 
@@ -279,7 +289,7 @@ object CsoraSubtitleService {
         }
     } catch (_: Exception) { null }
 
-    private fun extractZip(dir: File, zip: File, episode: Int): File? {
+    private fun extractZip(dir: File, zip: File, episode: Int): List<String> {
         Log.d(TAG, "ZIP_EXTRACT_START path=${zip.name} size=${zip.length()} episode=$episode")
         val extracted = mutableListOf<File>()
         ZipInputStream(zip.inputStream().buffered()).use { zis ->
@@ -297,9 +307,7 @@ object CsoraSubtitleService {
                             "ass", "ssa" -> if (isAss(out)) extracted += out
                             "vtt", "srt" -> if (isVttOrSrt(out)) extracted += out
                         }
-                        if (ext in setOf("ass", "ssa", "vtt", "srt")) {
-                            Log.d(TAG, "ZIP_ENTRY name=${entry.name} valid=${out in extracted}")
-                        }
+                        if (ext in setOf("ass", "ssa", "vtt", "srt")) Log.d(TAG, "ZIP_ENTRY name=${entry.name} valid=${out in extracted}")
                     }
                 }
                 zis.closeEntry()
@@ -307,20 +315,21 @@ object CsoraSubtitleService {
         }
         if (extracted.isEmpty()) {
             Log.w(TAG, "ZIP_NO_SUBTITLES entries=0")
-            return null
+            return emptyList()
         }
-        val selected = selectEpisode(extracted, episode) ?: extracted.singleOrNull()
-        Log.d(TAG, "ZIP_EXTRACT_DONE candidates=${extracted.map { it.name }} selected=${selected?.name}")
-        return selected
+        val selected = selectEpisodeFiles(extracted, episode)
+        Log.d(TAG, "ZIP_EXTRACT_DONE candidates=${selected.map { it.name }} count=${selected.size}")
+        return selected.map { it.absolutePath }
     }
 
-    private fun selectEpisode(files: List<File>, episode: Int): File? {
+    private fun selectEpisodeFiles(files: List<File>, episode: Int): List<File> {
         val exactNumber = Regex("(?<!\\d)0*${episode}(?!\\d)")
-        return files.firstOrNull { file ->
+        val exact = files.filter { file ->
             isEpisodeLink(file.name, episode) ||
                 isEpisodeRange(file.name, episode) ||
                 exactNumber.containsMatchIn(file.nameWithoutExtension)
         }
+        return if (exact.isNotEmpty()) exact else files
     }
 
     private fun getText(url: String): String {

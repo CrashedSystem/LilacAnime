@@ -26,7 +26,60 @@ object KairanPostMatcher {
                 KairanMatch(post, score)
             }
             .toList()
-        return candidates.maxByOrNull { it.similarity }?.takeIf { it.similarity >= MIN_SIMILARITY }
+
+        val strictMatch = candidates.maxByOrNull { it.similarity }
+            ?.takeIf { it.similarity >= MIN_SIMILARITY }
+        if (strictMatch != null) return strictMatch
+
+        // 일부 작품(특히 극장판/단편)은 Blogger 제목에 회차 번호가 없다.
+        // 앱에서는 이런 작품도 Episode 1로 표현될 수 있으므로,
+        // 회차 토큰을 요구하지 않는 '정확한 제목 근접 매칭'을 두 번째 단계로 사용한다.
+        if (episodeNumber == 1) {
+            val titleOnly = posts.asSequence()
+                .map { post ->
+                    val candidateTitle = removeEpisodeTokens(post.title, episodeNumber)
+                    val normalizedCandidate = normalizePostTitleForTitleOnly(candidateTitle)
+                    val score = weightedSimilarity(normalizedAnimeTitle, normalizedCandidate)
+                    Log.d(
+                        "KairanMatcher",
+                        "TITLE_ONLY_COMPARE query=[$normalizedAnimeTitle] candidate=[${post.title}] normalized=[$normalizedCandidate] score=$score"
+                    )
+                    KairanMatch(post, score)
+                }
+                .filter { match ->
+                    val normalizedCandidate = normalizePostTitleForTitleOnly(match.post.title)
+                    val exactLike = normalizedCandidate == normalizedAnimeTitle ||
+                        normalizedCandidate.contains(normalizedAnimeTitle) ||
+                        normalizedAnimeTitle.contains(normalizedCandidate)
+                    exactLike || match.similarity >= 0.78
+                }
+                .maxByOrNull { it.similarity }
+
+            if (titleOnly != null) {
+                Log.d(
+                    "KairanMatcher",
+                    "TITLE_ONLY_MATCH title=[${titleOnly.post.title}] similarity=${titleOnly.similarity}"
+                )
+                return titleOnly
+            }
+        }
+
+        return null
+    }
+
+    private fun normalizePostTitleForTitleOnly(title: String): String {
+        var value = title
+            .replace(Regex("\\b(?:한글\\s*)?자막\\b", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("\\b(?:한국어\\s*)?자막\\b", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("\\b(?:subtitle|sub)\\b", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("[\\[\\]【】()（）{}<>〈〉:：|]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        // Blogger/커뮤니티에서 '카구야'와 '가구야'가 혼용되는 경우가 있어
+        // 제목 매칭 단계에서만 두 표기를 같은 후보군으로 취급한다.
+        value = value.replace("카구야", "가구야")
+        return KairanTitleNormalizer.normalize(value)
     }
 
     fun filterNoise(input: String): String = HangulSimilarityMatcher.filterNoise(input)

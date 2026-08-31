@@ -1,0 +1,16 @@
+Kairan movie/title-only matching fix
+
+Problem:
+- The Kairan index is now complete (759/759), but episodeMatch() filtered out posts that do not contain an episode number.
+- This affects movie/one-shot titles represented by the app as episode 1, such as "초(超) 가구야 공주! 자막".
+
+Changes:
+- Keep strict episode matching as the first pass for normal episodic anime.
+- When episodeNumber == 1 and strict matching fails, run a title-only fallback over the full index.
+- Strip common subtitle suffixes (자막/한글자막/한국어자막/sub/subtitle) and punctuation for title-only matching.
+- Treat the common Korean spelling variants 카구야/가구야 as equivalent during title-only matching.
+- Accept exact/containment matches or similarity >= 0.78.
+- Log TITLE_ONLY_COMPARE and TITLE_ONLY_MATCH for diagnostics.
+
+Build note:
+- Source was checked after modification. Gradle compilation could not be executed in this environment because Gradle 9.0.0 is not cached and network access to services.gradle.org is unavailable.

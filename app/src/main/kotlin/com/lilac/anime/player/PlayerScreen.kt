@@ -85,6 +85,7 @@ import io.github.peerless2012.ass.media.type.AssRenderType
 import io.github.peerless2012.ass.media.widget.AssSubtitleView
 import com.lilac.anime.data.*
 import com.lilac.anime.data.subtitle.KairanSubtitleResult
+import com.lilac.anime.data.subtitle.SubtitleAssetUtil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -130,50 +131,50 @@ private fun SettingToggleRow(
     }
 }
 
-private fun loadCsoraFontsForSubtitle(context: Context, subtitlePath: String, assHandler: AssHandler): Int {
+private fun loadSubtitleFontsForSource(
+    context: Context,
+    subtitlePath: String,
+    source: String,
+    assHandler: AssHandler,
+    selectedFontPath: String? = null
+): Int {
     val subtitleFile = File(subtitlePath)
     val candidates = linkedSetOf<File>()
+    subtitleFile.parentFile?.let { parent -> candidates += File(parent, "fonts") }
 
-    subtitleFile.parentFile?.let { parent ->
-        candidates += File(parent, "fonts")
-    }
-
-    val root = File(context.filesDir, "csora_subtitles")
-    if (root.isDirectory) {
-        subtitleFile.parentFile?.name?.let { titleKey ->
-            candidates += File(root, "$titleKey/fonts")
-        }
+    if (source == "csora") {
+        val root = File(context.filesDir, "csora_subtitles")
+        subtitleFile.parentFile?.name?.let { titleKey -> candidates += File(root, "$titleKey/fonts") }
+    } else if (source == "kairan") {
+        val root = File(context.filesDir, "kairan_subtitles/fonts")
+        // Kairan keeps the subtitle itself flat for backwards compatibility.
+        // Its extracted fonts are stored under fonts/<normalized-title>.
+        val base = subtitleFile.nameWithoutExtension
+        val titleKey = Regex("^(.*)_\\d+(?:_.*)?$")
+            .find(base)?.groupValues?.getOrNull(1)
+            ?: base.substringBeforeLast("_")
+        candidates += File(root, titleKey)
     }
 
     fun collectFonts(dir: File): List<File> =
-        dir.walkTopDown()
-            .filter { file ->
-                file.isFile && file.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc")
-            }
+        if (!dir.isDirectory) emptyList() else dir.walkTopDown()
+            .filter { file -> file.isFile && file.extension.lowercase(Locale.ROOT) in setOf("ttf", "otf", "ttc") }
             .toList()
 
-    val fontFiles = candidates
-        .filter { it.isDirectory }
-        .flatMap(::collectFonts)
-        .distinctBy { it.absolutePath }
-
+    val fontFiles = candidates.flatMap(::collectFonts).distinctBy { it.absolutePath }
     var loaded = 0
     for (font in fontFiles) {
         try {
             val bytes = font.readBytes()
-            // libass receives the original attachment/file name together with the
-            // binary font data. Keep the extension and original basename intact.
             assHandler.addFont(font.name, bytes)
+            assHandler.addFont(font.nameWithoutExtension, bytes)
             loaded++
-            Log.d("Csora", "ASS_FONT_LOADED name=${font.name} size=${font.length()}")
+            Log.d("Subtitle", "ASS_FONT_LOADED source=$source name=${font.name} size=${font.length()}")
         } catch (e: Exception) {
-            Log.w("Csora", "ASS_FONT_LOAD_FAILED name=${font.name}", e)
+            Log.w("Subtitle", "ASS_FONT_LOAD_FAILED source=$source name=${font.name}", e)
         }
     }
-
-    if (fontFiles.isEmpty()) {
-        Log.w("Csora", "ASS_FONT_NONE subtitle=$subtitlePath candidates=${candidates.joinToString { it.absolutePath }}")
-    }
+    if (fontFiles.isEmpty()) Log.d("Subtitle", "ASS_FONT_NONE source=$source subtitle=$subtitlePath")
     return loaded
 }
 
@@ -306,6 +307,15 @@ fun PlayerScreen(
     var exoQualities by remember { mutableStateOf<List<ExoVideoQualityOption>>(emptyList()) }
     var selectedQualityOption by remember { mutableStateOf<ExoVideoQualityOption?>(null) }
     var showPlayerSettingsDialog by remember { mutableStateOf(false) }
+    var discoveredSubtitleFonts by remember { mutableStateOf<List<SubtitleAssetUtil.FontInfo>>(emptyList()) }
+
+    LaunchedEffect(anime.title, subtitlesUrl, subtitleSource) {
+        discoveredSubtitleFonts = withContext(Dispatchers.IO) {
+            (SubtitleAssetUtil.listFonts(context, anime.title, "kairan") +
+                SubtitleAssetUtil.listFonts(context, anime.title, "csora"))
+                .distinctBy { it.path }
+        }
+    }
 
     // 재생 속도는 전역 플레이어 설정에 저장되어 플레이어/일반 설정 화면에서 함께 사용한다.
     val playbackSpeed = vm.playerSettings.playbackSpeed
@@ -861,7 +871,7 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(streamUrl, subtitlesUrl, subtitleSource, syncOffsetMs, isOffline) {
+    LaunchedEffect(streamUrl, subtitlesUrl, subtitleSource, syncOffsetMs, isOffline, vm.playerSettings.subtitleFontPath, vm.playerSettings.subtitleFontSource) {
         val url = streamUrl ?: return@LaunchedEffect
         val isLocalFile = url.startsWith("file://") || url.startsWith("/")
 
@@ -930,12 +940,12 @@ fun PlayerScreen(
             // libass does not automatically use arbitrary files extracted next to
             // an external ASS subtitle. Register Csora's extracted TTF/OTF/TTC
             // files with AssHandler before the subtitle track is created.
-            if (subtitleSource == "csora" &&
+            if ((subtitleSource == "csora" || subtitleSource == "kairan") &&
                 (lowerSubPath.endsWith(".ass") || lowerSubPath.endsWith(".ssa"))) {
                 val loadedFonts = withContext(Dispatchers.IO) {
-                    loadCsoraFontsForSubtitle(context, subPath, assHandler)
+                    loadSubtitleFontsForSource(context, subPath, subtitleSource, assHandler, vm.playerSettings.subtitleFontPath.takeIf { vm.playerSettings.subtitleFontSource == subtitleSource })
                 }
-                Log.d("Csora", "ASS_FONT_COUNT loaded=$loadedFonts subtitle=$subPath")
+                Log.d("Subtitle", "ASS_FONT_COUNT source=$subtitleSource loaded=$loadedFonts subtitle=$subPath")
             }
 
             // Existing sync controls create shifted files for WebVTT/SRT/ASS/SSA.
@@ -951,18 +961,27 @@ fun PlayerScreen(
                 } ?: subPath
             } else subPath
 
+            val fontSelectedPath = vm.playerSettings.subtitleFontPath
+                .takeIf { vm.playerSettings.subtitleFontSource == subtitleSource && !it.isNullOrBlank() && File(it).isFile }
+            val fontAppliedSubtitlePath = if (fontSelectedPath != null && (lowerSubPath.endsWith(".ass") || lowerSubPath.endsWith(".ssa"))) {
+                SubtitleAssetUtil.prepareAssWithSelectedFont(effectiveSubtitlePath, fontSelectedPath)
+            } else {
+                effectiveSubtitlePath
+            }
+
             val subUri = when {
-                effectiveSubtitlePath.startsWith("http://") || effectiveSubtitlePath.startsWith("https://") ->
-                    Uri.parse(effectiveSubtitlePath)
-                effectiveSubtitlePath.startsWith("file://") ->
-                    Uri.parse(effectiveSubtitlePath)
-                else -> Uri.fromFile(File(effectiveSubtitlePath))
+                fontAppliedSubtitlePath.startsWith("http://") || fontAppliedSubtitlePath.startsWith("https://") ->
+                    Uri.parse(fontAppliedSubtitlePath)
+                fontAppliedSubtitlePath.startsWith("file://") ->
+                    Uri.parse(fontAppliedSubtitlePath)
+                else -> Uri.fromFile(File(fontAppliedSubtitlePath))
             }
 
             Log.d(
                 "Subtitle",
-                "LOAD source=$subtitleSource path=$subPath effective=$effectiveSubtitlePath " +
-                    "mime=$subtitleMimeType syncOffsetMs=$syncOffsetMs effectiveSyncOffsetMs=$effectiveSyncOffsetMs"
+                "LOAD source=$subtitleSource path=$subPath effective=$fontAppliedSubtitlePath " +
+                    "mime=$subtitleMimeType syncOffsetMs=$syncOffsetMs effectiveSyncOffsetMs=$effectiveSyncOffsetMs " +
+                    "selectedFont=${fontSelectedPath ?: "none"}"
             )
 
             val subtitleId =
@@ -1779,6 +1798,65 @@ fun PlayerScreen(
                         Spacer(Modifier.height(16.dp))
                         HorizontalDivider()
                         Spacer(Modifier.height(16.dp))
+
+                        if (discoveredSubtitleFonts.isNotEmpty()) {
+                            Spacer(Modifier.height(12.dp))
+                            Text("발견된 폰트", fontWeight = FontWeight.Bold, color = Color.White)
+                            Text(
+                                "Kairan/Csora에서 발견한 폰트입니다. 현재 자막 소스와 같은 폰트만 즉시 적용됩니다.",
+                                fontSize = 11.sp,
+                                color = Color.Gray
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            if (discoveredSubtitleFonts.isNotEmpty()) {
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth().clickable {
+                                        pendingSeekPositionMs = exoPlayer.currentPosition
+                                        vm.updatePlayerSettings(context, vm.playerSettings.copy(subtitleFontPath = null, subtitleFontSource = null))
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = if (vm.playerSettings.subtitleFontPath == null) Lilac.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.04f)
+                                ) {
+                                    Row(Modifier.padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        RadioButton(selected = vm.playerSettings.subtitleFontPath == null, onClick = null)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("ASS 원본 폰트", color = Color.White, fontSize = 12.sp)
+                                    }
+                                }
+                                Spacer(Modifier.height(5.dp))
+                                discoveredSubtitleFonts.forEach { font ->
+                                    val selected = vm.playerSettings.subtitleFontPath == font.path && vm.playerSettings.subtitleFontSource == font.source
+                                    Surface(
+                                        modifier = Modifier.fillMaxWidth().clickable {
+                                            pendingSeekPositionMs = exoPlayer.currentPosition
+                                            vm.updatePlayerSettings(
+                                                context,
+                                                vm.playerSettings.copy(
+                                                    subtitleFontPath = font.path,
+                                                    subtitleFontSource = font.source,
+                                                    subtitleSourcePreference = font.source
+                                                )
+                                            )
+                                        },
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (selected) Lilac.copy(alpha = 0.18f) else Color.White.copy(alpha = 0.04f)
+                                    ) {
+                                        Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                            RadioButton(selected = selected, onClick = null)
+                                            Spacer(Modifier.width(8.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(font.displayName, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Text(font.source.uppercase(Locale.ROOT), color = Color.Gray, fontSize = 9.sp)
+                                            }
+                                        }
+                                    }
+                                    Spacer(Modifier.height(4.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+                            Spacer(Modifier.height(10.dp))
+                        }
 
                         Text("자막 설정", fontWeight = FontWeight.Bold, color = Color.White)
                         Spacer(Modifier.height(10.dp))
