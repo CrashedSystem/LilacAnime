@@ -55,19 +55,23 @@ class AnimeRepository {
                 }.awaitAll().sortedBy { it.first }
             }
 
+            // 빈 페이지가 나온 지점까지만 유효 페이지로 취급하고 순회를 멈춘다.
+            // (첫 빈 페이지 앞의 페이지만 병합 -> 원본 중첩 루프 동작과 동일)
+            val usablePages = pageResults.takeWhile { (_, list) -> list.isNotEmpty() }
+            val hitEmptyPage = usablePages.size < pageResults.size
+
             var addedNew = false
-            for ((_, animeList) in pageResults) {
-                if (animeList.isEmpty()) {
-                    shouldStop = true
-                    break
-                } else {
-                    for (anime in animeList) {
-                        if (anime.id !in result) {
-                            result[anime.id] = anime
-                            addedNew = true
-                        }
+            for ((_, animeList) in usablePages) {
+                for (anime in animeList) {
+                    if (anime.id !in result) {
+                        result[anime.id] = anime
+                        addedNew = true
                     }
                 }
+            }
+
+            if (hitEmptyPage) {
+                shouldStop = true
             }
 
             if (!addedNew && result.isNotEmpty()) {

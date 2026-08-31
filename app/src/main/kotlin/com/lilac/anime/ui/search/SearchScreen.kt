@@ -60,10 +60,19 @@ fun SearchScreen(
                 if (q.isEmpty()) {
                     searchList
                 } else {
-                    searchList.filter {
-                        AnimeTitleMatcher.matches(it.title, q) ||
-                            it.genres.any { genre -> genre.contains(q, true) }
-                    }
+                    // 제목/alias 점수 우선순위로 정렬하고, 장르 일치는 후순위로 둔다.
+                    searchList
+                        .mapNotNull { anime ->
+                            val score = AnimeTitleMatcher.score(anime.title, q)
+                            when {
+                                score > 0 -> Triple(anime, score, false)
+                                anime.genres.any { it.contains(q, true) } -> Triple(anime, 0, true)
+                                else -> null
+                            }
+                        }
+                        .sortedWith(compareByDescending<Triple<Anime, Int, Boolean>> { it.second }
+                            .thenBy { it.third })
+                        .map { it.first }
                 }
             }
 

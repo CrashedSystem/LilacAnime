@@ -72,4 +72,7 @@ implementation("io.coil-kt.coil3:coil-network-okhttp:3.3.0")
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
     
     implementation("io.github.peerless2012:ass-media:0.5.1")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 }
