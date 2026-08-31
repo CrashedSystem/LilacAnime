@@ -59,6 +59,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.ViewCompat
 import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
@@ -431,28 +432,54 @@ fun PlayerScreen(
         offlineEp = OfflineStore.getEpisode(context, anime.id, currentEpisode.number)
     }
 
-    // 재생 화면에 들어와 있는 동안에는 상태바/내비게이션바 등 시스템 UI를
-    // 항상 숨긴다. 기기별로 transient bar가 다시 나타나는 문제를 줄이기 위해
-    // WindowInsets와 legacy immersive flags를 함께 적용한다.
-    LaunchedEffect(isFullScreen) {
-        activity?.window?.let { window ->
+    // 재생 화면에서는 Android 상태표시줄/내비게이션바를 완전히 숨긴다.
+    // 사용자가 위에서 아래로 스와이프해 시스템 상태표시줄을 잠깐 띄운 뒤에도
+    // 재생 화면이 다시 immersive 상태로 돌아가도록 시스템 UI 변경을 감시한다.
+    DisposableEffect(activity) {
+        val window = activity?.window
+        if (window == null) {
+            onDispose { }
+        } else {
             val decorView = window.decorView
-            val insetsController = WindowCompat.getInsetsController(window, decorView)
+            val controller = WindowCompat.getInsetsController(window, decorView)
+            val hiddenTypes = WindowInsetsCompat.Type.statusBars() or
+                WindowInsetsCompat.Type.navigationBars() or
+                WindowInsetsCompat.Type.captionBar()
+
+            fun hidePlayerSystemBars() {
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(hiddenTypes)
+                @Suppress("DEPRECATION")
+                decorView.systemUiVisibility =
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                        View.SYSTEM_UI_FLAG_FULLSCREEN or
+                        View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                        View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                        View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            }
+
             activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
-            insetsController.hide(
-                WindowInsetsCompat.Type.statusBars() or
-                    WindowInsetsCompat.Type.navigationBars() or
-                    WindowInsetsCompat.Type.captionBar()
-            )
+            hidePlayerSystemBars()
+
             @Suppress("DEPRECATION")
-            decorView.systemUiVisibility =
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-                    View.SYSTEM_UI_FLAG_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            decorView.setOnSystemUiVisibilityChangeListener {
+                // 상태표시줄이 사용자의 스와이프로 다시 나타난 경우 즉시 다시 숨긴다.
+                hidePlayerSystemBars()
+            }
+
+            ViewCompat.setOnApplyWindowInsetsListener(decorView) { view, insets ->
+                if (insets.isVisible(hiddenTypes)) {
+                    view.post { hidePlayerSystemBars() }
+                }
+                insets
+            }
+
+            onDispose {
+                @Suppress("DEPRECATION")
+                decorView.setOnSystemUiVisibilityChangeListener(null)
+                ViewCompat.setOnApplyWindowInsetsListener(decorView, null)
+            }
         }
     }
 
@@ -666,11 +693,43 @@ fun PlayerScreen(
         }
     }
 
-    // 3초 동안만 표시하고 사용자가 선택하지 않으면 현재 자막을 그대로 유지한다.
+    // 안내는 너무 빨리 사라지지 않도록 6초 동안 표시한다.
     LaunchedEffect(showKairanAssPrompt) {
         if (showKairanAssPrompt) {
-            delay(3000L)
+            delay(6000L)
             showKairanAssPrompt = false
+        }
+    }
+
+    // Csora ASS도 Kairan과 동일하게 백그라운드에서 발견하면 안내한다.
+    // 현재 자막을 즉시 바꾸지 않고 사용자가 선택할 수 있도록 한다.
+    LaunchedEffect(anime.id, anime.title, currentEpisode.number, isOffline, isDownloaded) {
+        if (isOffline || isDownloaded || csoraSubtitleResolved) return@LaunchedEffect
+        if (subtitleSource == "user" || subtitleSourcePreference == "csora") return@LaunchedEffect
+
+        val result = try {
+            withContext(Dispatchers.IO) {
+                CsoraSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+            }
+        } catch (e: Exception) {
+            Log.w("Csora", "BACKGROUND_ASS_SEARCH_FAILED episode=${currentEpisode.number}", e)
+            null
+        }
+
+        if (result is KairanSubtitleResult.DirectFile) {
+            discoveredCsoraAssPath = result.path
+            if (subtitleSource != "csora") {
+                showCsoraAssPrompt = true
+                Log.d("Csora", "BACKGROUND_ASS_FOUND path=${result.path} episode=${currentEpisode.number}")
+            }
+        }
+        csoraSubtitleResolved = true
+    }
+
+    LaunchedEffect(showCsoraAssPrompt) {
+        if (showCsoraAssPrompt) {
+            delay(6000L)
+            showCsoraAssPrompt = false
         }
     }
 
@@ -1299,7 +1358,10 @@ fun PlayerScreen(
                                 false
                             }
                             setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
-                                isControlsVisible = (visibility == View.VISIBLE)
+                                // PlayerView의 내부 controller 상태만 Compose에 전달한다.
+                                // 자동 숨김은 아래 LaunchedEffect가 담당하여 재생 중 상태와
+                                // 메뉴 상태를 항상 최신 값으로 참조하도록 한다.
+                                isControlsVisible = visibility == View.VISIBLE
                             })
                             applySubtitleSettingsToView(this)
 
@@ -1428,14 +1490,18 @@ fun PlayerScreen(
             }
         }
 
-        // PlayerView의 controller는 처음 표시될 때 내부 상태에 따라 계속 남아 있을 수 있다.
-        // 화면 진입 후 짧은 유예시간을 두고 명시적으로 숨겨 초기 UI가 터치 전까지
-        // 고정되는 문제를 방지한다. 이후 사용자가 터치하면 Media3 controller가 다시 표시한다.
-        LaunchedEffect(playerViewRef, streamUrl, isPlayerLocked, showPlayerSettingsDialog) {
+        // PlayerView controller는 표시 상태가 바뀔 때마다 별도의 타이머로 숨긴다.
+        // 기존처럼 playerViewRef만 key로 사용하면 controller가 다시 나타난 뒤
+        // LaunchedEffect가 재실행되지 않아 상단바가 계속 남는 경우가 있다.
+        // 메뉴가 열려 있는 동안에는 컨트롤을 유지한다.
+        LaunchedEffect(isControlsVisible, isPlayerLocked, showPlayerSettingsDialog, streamUrl) {
             val pv = playerViewRef ?: return@LaunchedEffect
-            if (isPlayerLocked || streamUrl == null || showPlayerSettingsDialog) return@LaunchedEffect
+            if (!isControlsVisible || isPlayerLocked || showPlayerSettingsDialog || streamUrl == null) return@LaunchedEffect
+
             delay(2500L)
-            if (pv.isControllerFullyVisible) {
+
+            // 메뉴가 열렸거나 잠금 상태로 바뀐 경우에는 숨기지 않는다.
+            if (!isPlayerLocked && !showPlayerSettingsDialog && pv.isControllerFullyVisible) {
                 pv.hideController()
             }
             isControlsVisible = false
@@ -1465,7 +1531,53 @@ fun PlayerScreen(
             }
         }
 
-        // 우측 하단에 3초간 조용히 표시되는 Kairan ASS 전환 안내.
+        // 우측 하단에 6초간 표시되는 Csora ASS 전환 안내.
+        AnimatedVisibility(
+            visible = showCsoraAssPrompt && !isPlayerLocked,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(16.dp),
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                tonalElevation = 6.dp,
+                shadowElevation = 8.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Csora ASS 자막을 발견했습니다. 바꾸시겠습니까?",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.widthIn(max = 260.dp)
+                    )
+                    TextButton(onClick = { showCsoraAssPrompt = false }) {
+                        Text("아니요")
+                    }
+                    Button(onClick = {
+                        discoveredCsoraAssPath?.let { path ->
+                            subtitlesUrl = path
+                            subtitleSource = "csora"
+                            subtitleSourcePreference = "csora"
+                            vm.updatePlayerSettings(
+                                context,
+                                vm.playerSettings.copy(subtitleSourcePreference = "csora")
+                            )
+                            Log.d("Csora", "USER_SWITCHED_TO_BACKGROUND_ASS path=$path episode=${currentEpisode.number}")
+                        }
+                        showCsoraAssPrompt = false
+                    }) {
+                        Text("예")
+                    }
+                }
+            }
+        }
+
+        // 우측 하단에 6초간 표시되는 Kairan ASS 전환 안내.
         AnimatedVisibility(
             visible = showKairanAssPrompt && !isPlayerLocked,
             modifier = Modifier
