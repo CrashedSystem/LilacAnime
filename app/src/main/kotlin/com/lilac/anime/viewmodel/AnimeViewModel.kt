@@ -3,7 +3,6 @@ package com.lilac.anime
 import kotlinx.coroutines.flow.update
 
 import android.content.Context
-import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -82,6 +81,7 @@ class AnimeViewModel : ViewModel() {
         private set
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var connectivityManager: ConnectivityManager? = null
 
     init {
         startProgressTracking()
@@ -142,6 +142,7 @@ class AnimeViewModel : ViewModel() {
         if (networkCallback != null) return
         
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        connectivityManager = cm
         val activeNetwork = cm.activeNetwork
         val capabilities = cm.getNetworkCapabilities(activeNetwork)
         val isConnected = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
@@ -489,22 +490,25 @@ class AnimeViewModel : ViewModel() {
     // 다운로드 취소 및 상태/파일 정리
 fun cancelDownload(context: Context, animeId: String, episodeNumber: Int) {
     val downloadKey = "${animeId}_${episodeNumber}"
-    
-    // 1. 진행 중인 서비스/Worker 작업 중단 요청
-    val intent = Intent(context, DownloadService::class.java).apply {
-        action = "ACTION_CANCEL_DOWNLOAD"
-        putExtra("EXTRA_ANIME_ID", animeId)
-        putExtra("EXTRA_EPISODE_NUMBER", episodeNumber)
-    }
-    context.startService(intent)
 
-    // 2. ViewModel 진행률 맵에서 제거
+    // 1. ViewModel 진행률 맵에서 제거
     _downloadProgressMap.update { currentMap ->
         currentMap - downloadKey
     }
     
-    // 3. DB 오프라인 데이터가 존재할 경우 제거
+    // 2. DB 오프라인 데이터 및 진행 중 다운로드 제거
+    //    (동시에 Media3 DownloadService.sendRemoveDownload로 진행 중/완료 작업 취소)
     deleteDownload(context, Anime(id = animeId, title = "", poster = "", backdrop = "", description = ""), episodeNumber)
+}
+
+override fun onCleared() {
+    super.onCleared()
+    // 등록된 네트워크 콜백을 해제해 ViewModel/콜백 누수를 막는다.
+    networkCallback?.let { cb ->
+        connectivityManager?.unregisterNetworkCallback(cb)
+    }
+    networkCallback = null
+    connectivityManager = null
 }
 }
 

@@ -1052,7 +1052,7 @@ fun PlayerScreen(
                     )
             }
             val cacheDataSourceFactory = CacheDataSource.Factory()
-                .setCache(LilacApplication.downloadCache)
+                .setCache(LilacApplication.streamingCache)
                 .setUpstreamDataSourceFactory(upstreamFactory)
                 .setCacheReadDataSourceFactory(FileDataSource.Factory())
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)

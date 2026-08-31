@@ -24,10 +24,25 @@ fun StreamUrlExtractor(
 ) {
     val detectedUrls = remember { mutableListOf<String>() }
     var isSubtitleFound by remember { mutableStateOf(false) }
+    var webView by remember { mutableStateOf<WebView?>(null) }
+
+    // 컴포지션에서 벗어날 때 WebView를 명시적으로 파괴해 네이티브 메모리 누수를 막는다.
+    DisposableEffect(Unit) {
+        onDispose {
+            webView?.apply {
+                stopLoading()
+                webChromeClient = null
+                removeAllViews()
+                destroy()
+            }
+            webView = null
+        }
+    }
 
     AndroidView(
         factory = { ctx ->
             WebView(ctx).apply {
+                webView = this
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true

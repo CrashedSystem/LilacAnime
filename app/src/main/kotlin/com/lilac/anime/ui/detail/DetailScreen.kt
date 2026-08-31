@@ -79,11 +79,15 @@ fun DetailScreen(
         currentExtractDeferred = deferred
         activeExtractEpisode = ep
 
-        val result = deferred.await()
+        // WebView가 onQualitiesFound를 영원히 호출하지 않는 상황에 대비해 타임아웃을 둔다.
+        // 실패 시 빈 결과를 반환해 다운로드 배치가 무한 대기하지 않도록 한다.
+        val result = kotlinx.coroutines.withTimeoutOrNull(45_000) {
+            deferred.await()
+        }
 
         activeExtractEpisode = null
         currentExtractDeferred = null
-        return result
+        return result ?: emptyList<StreamQuality>() to null
     }
 
     // 이미 영상이 다운로드된 에피소드에도 Linkkf VTT와 Kairan ASS를 모두 보충한다.

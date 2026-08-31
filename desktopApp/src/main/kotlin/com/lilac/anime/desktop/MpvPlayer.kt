@@ -19,10 +19,10 @@ object MpvPlayer {
         val volume: Double = 100.0
     )
 
-    private var process: Process? = null
-    private var writer: OutputStreamWriter? = null
+    @Volatile private var process: Process? = null
+    @Volatile private var writer: OutputStreamWriter? = null
     private val listeners = CopyOnWriteArrayList<(State) -> Unit>()
-    private var state = State()
+    @Volatile private var state = State()
     private val alive = AtomicBoolean(false)
 
     fun addListener(listener: (State) -> Unit) {
@@ -42,6 +42,70 @@ object MpvPlayer {
         require(url.isNotBlank()) { "m3u8 URL is empty" }
         stop()
 
+        val started = ProcessBuilder(buildCommand(url, subtitlePath, headers))
+            .redirectErrorStream(true)
+            .start()
+
+        synchronized(this@MpvPlayer) {
+            process = started
+            writer = OutputStreamWriter(started.outputStream, StandardCharsets.UTF_8)
+            alive.set(true)
+        }
+        publish(State(running = true))
+
+        thread(isDaemon = true, name = "Lilac-mpv-reader") {
+            runCatching {
+                BufferedReader(InputStreamReader(started.inputStream, StandardCharsets.UTF_8)).useLines { lines ->
+                    lines.forEach { parseStatus(it) }
+                }
+            }
+            alive.set(false)
+            publish(state.copy(running = false))
+        }
+    }
+
+    fun stop() {
+        runCatching {
+            writer?.write("quit\n")
+            writer?.flush()
+        }
+        synchronized(this@MpvPlayer) {
+            writer = null
+            process?.takeIf { it.isAlive }?.destroy()
+            process = null
+            alive.set(false)
+        }
+        publish(State())
+    }
+
+    fun togglePause() = command("cycle pause")
+    fun seek(seconds: Double) = command("seek $seconds relative")
+    fun setSpeed(value: Double) = command("set speed ${value.coerceIn(0.25, 4.0)}")
+    fun setVolume(value: Double) = command("set volume ${value.coerceIn(0.0, 100.0)}")
+    fun toggleFullscreen() = command("cycle fullscreen")
+    fun toggleSubtitles() = command("cycle sub-visibility")
+    fun subtitleDelay(milliseconds: Long) = command("add sub-delay ${milliseconds / 1000.0}")
+
+    fun setSubtitle(path: Path) {
+        command("sub-add \"${escape(path.toAbsolutePath().toString())}\"")
+    }
+
+    fun clearSubtitles() = command("sub-remove")
+
+    private fun command(value: String) {
+        if (!alive.get()) return
+        runCatching {
+            writer?.write(value)
+            writer?.write("\n")
+            writer?.flush()
+        }
+    }
+
+    private fun buildCommand(
+        url: String,
+        subtitlePath: String?,
+        headers: Map<String, String>
+    ): List<String> {
         val command = mutableListOf(
             "mpv",
             "--hwdec=auto",
@@ -71,60 +135,7 @@ object MpvPlayer {
         }
 
         command += url
-
-        val started = ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .start()
-
-        process = started
-        writer = OutputStreamWriter(started.outputStream, StandardCharsets.UTF_8)
-        alive.set(true)
-        publish(State(running = true))
-
-        thread(isDaemon = true, name = "Lilac-mpv-reader") {
-            runCatching {
-                BufferedReader(InputStreamReader(started.inputStream, StandardCharsets.UTF_8)).useLines { lines ->
-                    lines.forEach { parseStatus(it) }
-                }
-            }
-            alive.set(false)
-            publish(state.copy(running = false))
-        }
-    }
-
-    fun stop() {
-        runCatching {
-            writer?.write("quit\n")
-            writer?.flush()
-        }
-        writer = null
-        process?.takeIf { it.isAlive }?.destroy()
-        process = null
-        alive.set(false)
-        publish(State())
-    }
-
-    fun togglePause() = command("cycle pause")
-    fun seek(seconds: Double) = command("seek $seconds relative")
-    fun setSpeed(value: Double) = command("set speed ${value.coerceIn(0.25, 4.0)}")
-    fun setVolume(value: Double) = command("set volume ${value.coerceIn(0.0, 100.0)}")
-    fun toggleFullscreen() = command("cycle fullscreen")
-    fun toggleSubtitles() = command("cycle sub-visibility")
-    fun subtitleDelay(milliseconds: Long) = command("add sub-delay ${milliseconds / 1000.0}")
-
-    fun setSubtitle(path: Path) {
-        command("sub-add \"${escape(path.toAbsolutePath().toString())}\"")
-    }
-
-    fun clearSubtitles() = command("sub-remove")
-
-    private fun command(value: String) {
-        if (!alive.get()) return
-        runCatching {
-            writer?.write(value)
-            writer?.write("\n")
-            writer?.flush()
-        }
+        return command
     }
 
     private fun parseStatus(line: String) {

@@ -7,6 +7,7 @@ import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.cache.Cache
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.offline.DownloadManager
@@ -20,6 +21,7 @@ class LilacApplication : Application() {
     companion object {
         lateinit var databaseProvider: DatabaseProvider
         lateinit var downloadCache: Cache
+        lateinit var streamingCache: Cache
         lateinit var dataSourceFactory: HttpDataSource.Factory
         lateinit var downloadManager: DownloadManager
     }
@@ -30,11 +32,23 @@ class LilacApplication : Application() {
         // 1. 다운로드 정보 저장을 위한 데이터베이스
         databaseProvider = StandaloneDatabaseProvider(this)
 
+        // 외부 저장소를 사용할 수 없으면 내부 저장소로 폴백해 시작 시 크래시를 막는다.
+        val baseDir = getExternalFilesDir(null) ?: filesDir
+
         // 2. 영상 조각들이 실제로 저장될 캐시 폴더 설정
-        val cacheDir = File(getExternalFilesDir(null), "lilac_downloads")
+        val cacheDir = File(baseDir, "lilac_downloads")
         downloadCache = SimpleCache(
             cacheDir,
             NoOpCacheEvictor(), // 다운로드된 파일이 자동으로 삭제되지 않도록 설정
+            databaseProvider
+        )
+
+        // 2-1. 스트리밍 재생용 별도 캐시. 재생은 LRU로 오래된 조각을 자동 정리해
+        //     임시 재생 데이터가 디스크를 무한히 채우지 않도록 한다.
+        val streamingCacheDir = File(baseDir, "lilac_streaming_cache")
+        streamingCache = SimpleCache(
+            streamingCacheDir,
+            LeastRecentlyUsedCacheEvictor(512L * 1024L * 1024L), // 최대 512MB
             databaseProvider
         )
 
