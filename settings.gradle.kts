@@ -18,3 +18,4 @@ rootProject.name = "LilacAnime"
 
 include(":app")
 include(":desktopApp")
+include(":desktopPort")

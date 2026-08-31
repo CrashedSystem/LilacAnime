@@ -1,0 +1,304 @@
+package com.lilac.anime.portdata
+
+import com.lilac.anime.portdata.Anime
+import com.lilac.anime.portdata.Episode
+import org.jsoup.nodes.Document
+
+
+object LinkkfParser {
+
+    private const val BASE_URL = "https://linkkf.tv"
+
+    // =========================================================
+    // 애니 목록
+    // =========================================================
+
+    fun parseAnimeList(
+        document: Document
+    ): List<Anime> {
+
+        return document
+            .select("div.vod-item")
+            .mapNotNull { item ->
+
+                val titleLink =
+                    item.selectFirst("h3.vod-item-title a")
+                        ?: return@mapNotNull null
+
+                val title =
+                    titleLink.text().trim()
+
+                val detailUrl =
+                    titleLink.absUrl("href").trim()
+
+                if (title.isBlank() || detailUrl.isBlank()) {
+                    return@mapNotNull null
+                }
+
+                // =================================================
+                // 이미지
+                //
+                // 실제 구조:
+                //
+                // data-original=
+                // https://rez1.imgdarr.top/370x/https://k2.1imgdarr.top/...
+                //
+                // poster   -> 리사이즈 이미지
+                // backdrop -> 원본 이미지
+                // =================================================
+
+                val imageWrapper =
+                    item.selectFirst(".img-wrapper")
+
+                val imageUrl =
+                    imageWrapper
+                        ?.attr("data-original")
+                        ?.trim()
+                        .orEmpty()
+
+                val poster =
+                    normalizeImageUrl(imageUrl)
+
+                val backdrop =
+                    extractOriginalImageUrl(imageUrl)
+
+                Anime(
+                    id = extractAnimeId(detailUrl),
+                    title = title,
+                    description = "",
+                    poster = poster,
+                    backdrop = backdrop,
+                    genres = emptyList(),
+                    episodes = emptyList(),
+                    detailUrl = detailUrl
+                )
+            }
+            .distinctBy { it.id }
+    }
+
+    // =========================================================
+    // 이미지 URL 정리
+    // =========================================================
+
+    private fun normalizeImageUrl(
+        url: String
+    ): String {
+
+        if (url.isBlank()) {
+            return ""
+        }
+
+        return when {
+            url.startsWith("http://") ||
+            url.startsWith("https://") -> {
+                url
+            }
+
+            url.startsWith("//") -> {
+                "https:$url"
+            }
+
+            url.startsWith("/") -> {
+                "$BASE_URL$url"
+            }
+
+            else -> {
+                "$BASE_URL/$url"
+            }
+        }
+    }
+
+    // =========================================================
+    // 원본 이미지 URL 추출
+    //
+    // 예:
+    //
+    // https://rez1.imgdarr.top/370x/
+    // https://k2.1imgdarr.top/anime/196974/xxxxx.webp
+    //
+    // =>
+    //
+    // https://k2.1imgdarr.top/anime/196974/xxxxx.webp
+    // =========================================================
+
+    private fun extractOriginalImageUrl(
+        url: String
+    ): String {
+
+        if (url.isBlank()) {
+            return ""
+        }
+
+        val normalized =
+            normalizeImageUrl(url)
+
+        val resizePrefix =
+            "/370x/"
+
+        val index =
+            normalized.indexOf(resizePrefix)
+
+        if (index >= 0) {
+            val original =
+                normalized.substring(
+                    index + resizePrefix.length
+                )
+
+            if (
+                original.startsWith("http://") ||
+                original.startsWith("https://")
+            ) {
+                return original
+            }
+        }
+
+        // 이미 원본 URL인 경우
+        return normalized
+    }
+
+    // =========================================================
+    // 작품 상세
+    // =========================================================
+
+    fun parseAnimeDetail(
+        document: Document,
+        original: Anime
+    ): Anime {
+
+        val title =
+            document
+                .selectFirst(".detail-info-title")
+                ?.text()
+                ?.trim()
+                ?: original.title
+
+        val description =
+            document
+                .selectFirst(".detail-desc-content")
+                ?.text()
+                ?.trim()
+                ?: original.description
+
+        val genres =
+            document
+                .select(".detail-info-desc li")
+                .firstOrNull {
+                    it.text().contains("장르")
+                }
+                ?.select("a")
+                ?.map {
+                    it.text().trim()
+                }
+                ?.filter {
+                    it.isNotBlank()
+                }
+                ?.distinct()
+                ?: emptyList()
+
+        return original.copy(
+            title = title,
+            description = description,
+            genres = genres
+        )
+    }
+
+    // =========================================================
+    // 회차 (자막)
+    // =========================================================
+
+    fun parseEpisodes(
+        document: Document,
+        anime: Anime
+    ): List<Episode> {
+
+        return document
+            .select(
+                ".episode-box ul#ewave-playlist-1 a.ep"
+            )
+            .mapNotNull { link ->
+
+                val pageUrl =
+                    link.absUrl("href").trim()
+
+                val epNum =
+                    link.text().trim().toIntOrNull()
+
+                if (
+                    pageUrl.isBlank() ||
+                    epNum == null
+                ) {
+                    null
+                } else {
+                    Episode(
+                        id = "${anime.id}_ep_$epNum",
+                        number = epNum,
+                        title = "${epNum}화",
+                        description = "${anime.title} ${epNum}화",
+                        videoUrl = pageUrl
+                    )
+                }
+            }
+            .distinctBy {
+                it.number
+            }
+            .sortedBy {
+                it.number
+            }
+    }
+
+    // =========================================================
+    // 회차 (더빙)
+    // =========================================================
+
+    fun parseDubEpisodes(
+        document: Document,
+        anime: Anime
+    ): List<Episode> {
+
+        return document
+            .select(
+                ".episode-box ul#ewave-playlist-2 a.ep"
+            )
+            .mapNotNull { link ->
+
+                val pageUrl =
+                    link.absUrl("href").trim()
+
+                val epNum =
+                    link.text().trim().toIntOrNull()
+
+                if (
+                    pageUrl.isBlank() ||
+                    epNum == null
+                ) {
+                    null
+                } else {
+                    Episode(
+                        id = "${anime.id}_dub_ep_$epNum",
+                        number = epNum,
+                        title = "${epNum}화 (더빙)",
+                        description = "${anime.title} ${epNum}화 (더빙)",
+                        videoUrl = pageUrl
+                    )
+                }
+            }
+            .distinctBy {
+                it.number
+            }
+            .sortedBy {
+                it.number
+            }
+    }
+
+    // =========================================================
+    // 유틸
+    // =========================================================
+
+    private fun extractAnimeId(
+        url: String
+    ): String {
+        return url
+            .trimEnd('/')
+            .substringAfterLast('/')
+    }
+}
