@@ -93,7 +93,7 @@ object SubtitleStore {
             .getString(fontPathKey(animeId, source), null)
             ?.takeIf { File(it).isFile }
 
-    fun saveSelectedFont(context: Context, animeId: String, source: String, path: String?) {
+    suspend fun saveSelectedFont(context: Context, animeId: String, source: String, path: String?) = withContext(Dispatchers.IO) {
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
             .apply {
                 if (path.isNullOrBlank()) remove(fontPathKey(animeId, source))
@@ -102,7 +102,7 @@ object SubtitleStore {
             }.apply()
     }
 
-    fun clearSelectedFont(context: Context, animeId: String, source: String) {
+    suspend fun clearSelectedFont(context: Context, animeId: String, source: String) = withContext(Dispatchers.IO) {
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit()
             .remove(fontPathKey(animeId, source))
             .remove(fontSourceKey(animeId, source))

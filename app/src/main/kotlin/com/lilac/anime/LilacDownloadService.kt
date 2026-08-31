@@ -1,6 +1,7 @@
 package com.lilac.anime
 
 import android.app.Notification
+import android.app.NotificationManager
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadManager
@@ -14,7 +15,7 @@ class LilacDownloadService : DownloadService(
     DEFAULT_FOREGROUND_NOTIFICATION_UPDATE_INTERVAL,
     CHANNEL_ID,
     androidx.media3.exoplayer.R.string.exo_download_notification_channel_name,
-    0
+    NotificationManager.IMPORTANCE_LOW
 ) {
     companion object {
         private const val CHANNEL_ID = "lilac_download_channel"

@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 object OfflineStore {
     private const val PREF_NAME = "lilac_offline_store"
 
@@ -57,9 +58,6 @@ object OfflineStore {
                 .apply()
             0L
         } else {
-            if (!migratedLegacyCsoraSync) {
-                prefs.edit().putBoolean("migrated_legacy_csora_sync_1000", true).apply()
-            }
             syncOffset
         }
 
@@ -148,8 +146,10 @@ object OfflineStore {
         }
     }
 
+    private fun animeListFile(context: Context): File =
+        File(context.filesDir, "cached_anime_list.json")
+
     suspend fun saveAnimeList(context: Context, list: List<Anime>) = withContext(Dispatchers.IO) {
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         val array = JSONArray()
         list.forEach { anime ->
             val json = JSONObject().apply {
@@ -162,14 +162,20 @@ object OfflineStore {
             }
             array.put(json)
         }
-        prefs.edit().putString("cached_anime_list", array.toString()).apply()
+        val file = animeListFile(context)
+        val temp = File(file.parentFile, file.name + ".tmp")
+        temp.writeText(array.toString(), Charsets.UTF_8)
+        if (!temp.renameTo(file)) {
+            file.writeText(array.toString(), Charsets.UTF_8)
+            temp.delete()
+        }
     }
 
     suspend fun getSavedAnimeList(context: Context): List<Anime> = withContext(Dispatchers.IO) {
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        val jsonString = prefs.getString("cached_anime_list", null) ?: return@withContext emptyList()
+        val file = animeListFile(context)
+        if (!file.isFile) return@withContext emptyList()
         try {
-            val array = JSONArray(jsonString)
+            val array = JSONArray(file.readText(Charsets.UTF_8))
             val list = mutableListOf<Anime>()
             for (i in 0 until array.length()) {
                 val json = array.getJSONObject(i)

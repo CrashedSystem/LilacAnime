@@ -31,6 +31,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 class AnimeViewModel : ViewModel() {
@@ -249,12 +251,25 @@ class AnimeViewModel : ViewModel() {
         
         viewModelScope.launch {
             try {
+                // 배치마다 allAnime을 전면 교체하면 카탈로그가 실시간으로 쌓이는 동안
+                // 이를 읽는 화면(검색/전체 목록)이 연쇄 recomposition되어 전역 버벅임이 생긴다.
+                // 중간 배치는 캐시(IO)에만 쌓고, allAnime 상태는 수집이 끝난 뒤 한 번만 갱신한다.
+                var finalList: List<Anime> = emptyList()
                 repository.getAllAnimeListFlow().collect { list ->
-                    allAnime = list
-                    list.forEach { animeCache[it.id] = it }
+                    finalList = list
+                    withContext(Dispatchers.IO) {
+                        list.forEach { animeCache[it.id] = it }
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    allAnime = finalList
                 }
                 isAllAnimeFullyLoaded = true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w("AnimeAll", "ALL_ANIME_LOAD_FAILED", e)
+                if (allAnime.isEmpty()) {
+                    error = e.message ?: "전체 목록을 불러오지 못했습니다."
+                }
             } finally {
                 isAllAnimeLoading = false
             }
@@ -458,11 +473,17 @@ class AnimeViewModel : ViewModel() {
         }
     }
 
+    private val librarySaveMutex = kotlinx.coroutines.sync.Mutex()
+
     fun toggleLibrary(context: Context, animeId: String) {
         library = if (animeId in library) library - animeId else library + animeId
-        val updated = library
         viewModelScope.launch(Dispatchers.IO) {
-            OfflineStore.saveLibrary(context, updated)
+            // 연속/빠른 토글 시에도 디스크에는 항상 최신 library 상태를 기록한다.
+            // 캡처 시점이 다른 여러 launch가 reorder돼도 락 안에서 현재 상태를
+            // 다시 읽어 마지막 상태가 최종 저장됨을 보장한다.
+            librarySaveMutex.withLock {
+                OfflineStore.saveLibrary(context, library)
+            }
         }
     }
 

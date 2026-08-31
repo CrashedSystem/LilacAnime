@@ -16,7 +16,7 @@ object CsoraBlogRepository {
     private const val BLOG_URL = "https://csora556.blogspot.com"
     private const val CACHE_FILE = "csora_blog_index.json"
     private const val CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L
-    private const val PAGE_SIZE = 500
+    private const val PAGE_SIZE = 100
 
     suspend fun getPosts(context: Context): List<KairanPost> = withContext(Dispatchers.IO) {
         val cache = File(context.filesDir, CACHE_FILE)
@@ -37,11 +37,25 @@ object CsoraBlogRepository {
     private fun downloadAllPosts(): List<KairanPost> {
         val out = LinkedHashMap<String, KairanPost>()
         var start = 1
-        while (true) {
+        var consecutiveEmpty = 0
+        while (consecutiveEmpty < 3) {
             val page = downloadPage(start)
-            if (page.isEmpty()) break
-            page.forEach { out[it.url] = it }
+            if (page.isEmpty()) {
+                consecutiveEmpty++
+                if (consecutiveEmpty >= 3) break
+                start += PAGE_SIZE
+                continue
+            }
+            consecutiveEmpty = 0
+            var addedNew = false
+            page.forEach {
+                if (it.url !in out) {
+                    out[it.url] = it
+                    addedNew = true
+                }
+            }
             if (page.size < PAGE_SIZE) break
+            if (!addedNew) break
             start += PAGE_SIZE
         }
         Log.d(TAG, "INDEX_COMPLETE count=${out.size}")
@@ -101,6 +115,8 @@ object CsoraBlogRepository {
     private fun saveCache(file: File, posts: List<KairanPost>) {
         val array = JSONArray()
         posts.forEach { array.put(JSONObject().put("title", it.title).put("url", it.url)) }
-        file.writeText(array.toString(), Charsets.UTF_8)
+        val temp = File(file.parentFile, file.name + ".tmp")
+        temp.writeText(array.toString(), Charsets.UTF_8)
+        if (!temp.renameTo(file)) { file.writeText(array.toString(), Charsets.UTF_8); temp.delete() }
     }
 }

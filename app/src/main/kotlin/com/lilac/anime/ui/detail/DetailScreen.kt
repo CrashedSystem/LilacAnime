@@ -60,6 +60,27 @@ fun DetailScreen(
     val episodes = vm.episodes(currentAnime)
     val episodesLoading = vm.isEpisodesLoading(currentAnime)
 
+    // 회차 목록 정렬/페이지네이션 상태 (게시판식)
+    var epAscending by remember { mutableStateOf(true) }
+    var epPageSize by remember { mutableIntStateOf(20) }
+    var epPage by remember { mutableIntStateOf(1) }
+    var epPageSizeMenuExpanded by remember { mutableStateOf(false) }
+
+    // 회차는 번호 기준으로 정렬한다.
+    val sortedEpisodes = remember(episodes, epAscending) {
+        val list = episodes.sortedBy { it.number }
+        if (epAscending) list else list.reversed()
+    }
+    val epTotalPages = maxOf(1, (sortedEpisodes.size + epPageSize - 1) / epPageSize)
+    if (epPage > epTotalPages) {
+        epPage = epTotalPages
+    }
+    val pageEpisodes = remember(sortedEpisodes, epPage, epPageSize) {
+        val from = (epPage - 1) * epPageSize
+        if (from >= sortedEpisodes.size || sortedEpisodes.isEmpty()) emptyList()
+        else sortedEpisodes.subList(from, minOf(from + epPageSize, sortedEpisodes.size))
+    }
+
     val downloadProgressMap by vm.downloadProgressMap.collectAsState()
 
     // 배치 다운로드 상태 관리
@@ -447,11 +468,41 @@ fun DetailScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("에피소드", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+                        Text("에피소드 ${pageEpisodes.size}/${episodes.size}", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = {
+                                epAscending = !epAscending
+                                epPage = 1
+                            }) {
+                                Icon(
+                                    if (epAscending) Icons.Default.ArrowUpward else Icons.Default.ArrowDownward,
+                                    contentDescription = if (epAscending) "오름차순" else "내림차순",
+                                    tint = Lilac
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = epPageSizeMenuExpanded,
+                                onDismissRequest = { epPageSizeMenuExpanded = false }
+                            ) {
+                                listOf(10, 20, 30, 50).forEach { size ->
+                                    DropdownMenuItem(
+                                        text = { Text("${size}개씩 보기") },
+                                        onClick = {
+                                            epPageSize = size
+                                            epPage = 1
+                                            epPageSizeMenuExpanded = false
+                                        }
+                                    )
+                                }
+                            }
+                            IconButton(onClick = { epPageSizeMenuExpanded = !epPageSizeMenuExpanded }) {
+                                Icon(Icons.Default.ViewHeadline, contentDescription = "페이지 크기", tint = Lilac)
+                            }
+                        }
                     }
                 }
 
-                items(episodes) { ep ->
+                items(pageEpisodes) { ep ->
                     val downloadKey = "${currentAnime.id}_${ep.number}"
                     val isDownloaded = vm.isEpisodeDownloaded(currentAnime.id, ep.number)
                     val downloadingProgress = downloadProgressMap[downloadKey]
@@ -543,6 +594,34 @@ fun DetailScreen(
                             }
                             else -> {
                                 Icon(Icons.Default.CloudOff, contentDescription = "오프라인", tint = Color.Gray)
+                            }
+                        }
+                    }
+                }
+
+                if (epTotalPages > 1) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(
+                                enabled = epPage > 1,
+                                onClick = { epPage = (epPage - 1).coerceAtLeast(1) }
+                            ) {
+                                Icon(Icons.Default.KeyboardArrowLeft, contentDescription = "이전", tint = if (epPage > 1) Lilac else Color.Gray)
+                            }
+                            Text(
+                                "$epPage / $epTotalPages",
+                                color = MaterialTheme.colorScheme.onBackground,
+                                fontWeight = FontWeight.Bold
+                            )
+                            IconButton(
+                                enabled = epPage < epTotalPages,
+                                onClick = { epPage = (epPage + 1).coerceAtMost(epTotalPages) }
+                            ) {
+                                Icon(Icons.Default.KeyboardArrowRight, contentDescription = "다음", tint = if (epPage < epTotalPages) Lilac else Color.Gray)
                             }
                         }
                     }

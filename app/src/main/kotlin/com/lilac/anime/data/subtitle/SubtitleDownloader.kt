@@ -23,18 +23,22 @@ suspend fun downloadSubtitleFile(
         try {
             val url = URL(vttUrl)
             val connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            connection.connectTimeout = 8000
-            connection.readTimeout = 8000
+            try {
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                connection.connectTimeout = 8000
+                connection.readTimeout = 8000
 
-            if (connection.responseCode == 200) {
-                val text = connection.inputStream.bufferedReader().use { it.readText() }
-                val file = File(context.filesDir, "sub_${animeId}_${episodeNumber}.vtt")
-                file.writeText(text)
-                file.absolutePath
-            } else {
-                null
+                if (connection.responseCode == 200) {
+                    val text = connection.inputStream.bufferedReader().use { it.readText() }
+                    val file = File(context.filesDir, "sub_${animeId}_${episodeNumber}.vtt")
+                    file.writeText(text)
+                    file.absolutePath
+                } else {
+                    null
+                }
+            } finally {
+                connection.disconnect()
             }
         } catch (e: Exception) {
             e.printStackTrace()

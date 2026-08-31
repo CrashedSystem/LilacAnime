@@ -125,6 +125,8 @@ object GoogleDriveDownloader {
                 if (code in 300..399) {
                     val location = connection.getHeaderField("Location") ?: return null
                     current = resolveUrl(current, location)
+                    try { connection.inputStream?.close() } catch (_: Exception) {}
+                    try { connection.errorStream?.close() } catch (_: Exception) {}
                     continue
                 }
 
@@ -255,7 +257,7 @@ object GoogleDriveDownloader {
     private fun looksLikeHtml(file: File): Boolean {
         val text = readSmallText(file).trimStart().lowercase()
         return text.startsWith("<html") || text.startsWith("<!doctype") || text.startsWith("<head") ||
-            text.contains("google drive") && (text.contains("download") || text.contains("sign in"))
+            (text.contains("google drive") && (text.contains("download") || text.contains("sign in")))
     }
 
     private fun readSmallText(file: File): String = try {
