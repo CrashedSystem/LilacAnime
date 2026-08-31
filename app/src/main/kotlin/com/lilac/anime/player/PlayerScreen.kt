@@ -705,7 +705,7 @@ fun PlayerScreen(
         if (subtitleSourcePreference == "kairan") {
             val result = try {
                 withContext(Dispatchers.IO) {
-                    KairanSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                    KairanSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
                 }
             } catch (e: Exception) {
                 Log.w("Kairan", "SUBTITLE_SEARCH_FAILED episode=${currentEpisode.number}", e)
@@ -730,7 +730,7 @@ fun PlayerScreen(
             subtitlesUrl = null
             val result = try {
                 withContext(Dispatchers.IO) {
-                    CsoraSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                    CsoraSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
                 }
             } catch (e: Exception) {
                 Log.w("Csora", "SUBTITLE_SEARCH_FAILED episode=${currentEpisode.number}", e)
@@ -762,7 +762,7 @@ fun PlayerScreen(
 
         val result = try {
             withContext(Dispatchers.IO) {
-                KairanSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                KairanSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
             }
         } catch (e: Exception) {
             Log.w("Kairan", "BACKGROUND_ASS_SEARCH_FAILED episode=${currentEpisode.number}", e)
@@ -795,7 +795,7 @@ fun PlayerScreen(
 
         val result = try {
             withContext(Dispatchers.IO) {
-                CsoraSubtitleService.findSubtitle(context, anime.title, currentEpisode.number)
+                CsoraSubtitleService.findSubtitle(context, anime.id, anime.title, currentEpisode.number)
             }
         } catch (e: Exception) {
             Log.w("Csora", "BACKGROUND_ASS_SEARCH_FAILED episode=${currentEpisode.number}", e)

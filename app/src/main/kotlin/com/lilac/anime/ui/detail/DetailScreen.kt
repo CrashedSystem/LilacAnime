@@ -127,7 +127,7 @@ fun DetailScreen(
             var kairanPath = kairanReady
             if (kairanPath == null) {
                 kairanPath = try {
-                    when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
+                                when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.id, currentAnime.title, ep.number)) {
                         is KairanSubtitleResult.DirectFile -> result.path
                         null -> null
                     }
@@ -140,7 +140,7 @@ fun DetailScreen(
             var csoraPath = csoraReady
             if (csoraPath == null) {
                 csoraPath = try {
-                    when (val result = CsoraSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
+                    when (val result = CsoraSubtitleService.findSubtitle(context, currentAnime.id, currentAnime.title, ep.number)) {
                         is KairanSubtitleResult.DirectFile -> result.path
                         null -> null
                     }
@@ -218,7 +218,7 @@ fun DetailScreen(
                         context, currentAnime.id, ep.number, vttUrl
                     )
                     val localKairanPath = try {
-                        when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
+                        when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.id, currentAnime.title, ep.number)) {
                             is KairanSubtitleResult.DirectFile -> result.path
                             null -> null
                         }
@@ -277,7 +277,7 @@ fun DetailScreen(
                                 context, currentAnime.id, ep.number, vttUrl
                             )
                             val localKairanPath = try {
-                                when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.title, ep.number)) {
+                    when (val result = KairanSubtitleService.findSubtitle(context, currentAnime.id, currentAnime.title, ep.number)) {
                                     is KairanSubtitleResult.DirectFile -> result.path
                                     null -> null
                                 }

@@ -23,14 +23,14 @@ object KairanSubtitleService {
     private const val ASSET_SCHEMA_VERSION = 3
     private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 
-    suspend fun findSubtitle(context: Context, title: String, episodeNumber: Int): KairanSubtitleResult? =
+    suspend fun findSubtitle(context: Context, animeId: String, title: String, episodeNumber: Int): KairanSubtitleResult? =
         withContext(Dispatchers.IO) {
             try {
                 Log.d(TAG, "START_SEARCH title=[$title] episode=$episodeNumber")
                 val normalizedTitle = KairanTitleNormalizer.normalize(title)
                 Log.d(TAG, "NORMALIZED_TITLE original=[$title] normalized=[$normalizedTitle]")
 
-                SubtitleStore.get(context, normalizeTitleForFile(title), episodeNumber, "kairan")
+                SubtitleStore.get(context, animeId, episodeNumber, "kairan")
                     ?.takeIf { File(it).isFile }
                     ?.let {
                         val hasFonts = hasKairanFonts(context, it)
@@ -72,7 +72,7 @@ object KairanSubtitleService {
                 val selected = SubtitleAssetUtil.resolveAssCandidates(context, title, episodeNumber, subtitleCandidates)
                 markAssetScan(context, title, episodeNumber)
                 if (selected != null) {
-                    SubtitleStore.save(context, normalizeTitleForFile(title), episodeNumber, "kairan", selected)
+                    SubtitleStore.save(context, animeId, episodeNumber, "kairan", selected)
                     Log.d(TAG, "SUBTITLE_READY path=$selected fonts=$fontCount candidates=${subtitleCandidates.size}")
                     return@withContext KairanSubtitleResult.DirectFile(selected)
                 }
