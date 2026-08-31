@@ -33,10 +33,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import kotlin.math.roundToInt
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -82,6 +84,7 @@ import io.github.peerless2012.ass.media.parser.AssSubtitleParserFactory
 import io.github.peerless2012.ass.media.type.AssRenderType
 import io.github.peerless2012.ass.media.widget.AssSubtitleView
 import com.lilac.anime.data.*
+import com.lilac.anime.data.subtitle.KairanSubtitleResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -90,6 +93,43 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
+@Composable
+private fun SettingToggleRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = Color.White.copy(alpha = 0.055f)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onCheckedChange(!checked) }
+                .padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, contentDescription = null, tint = Lilac, modifier = Modifier.size(19.dp))
+            Spacer(Modifier.width(10.dp))
+            Text(title, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color.White, modifier = Modifier.weight(1f))
+            Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                modifier = Modifier.scale(0.82f),
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Color.White,
+                    checkedTrackColor = Lilac,
+                    uncheckedThumbColor = Color.LightGray,
+                    uncheckedTrackColor = Color.DarkGray
+                )
+            )
+        }
+    }
+}
+
 private fun loadCsoraFontsForSubtitle(context: Context, subtitlePath: String, assHandler: AssHandler): Int {
     val subtitleFile = File(subtitlePath)
     val candidates = linkedSetOf<File>()
@@ -207,6 +247,7 @@ fun PlayerScreen(
     val scope = rememberCoroutineScope()
     val activity = context as? Activity
     val isOffline by vm.isOffline.collectAsState()
+    val isInPictureInPicture = MainActivity.isInPictureInPicture
     
     var currentEpisode by remember(episode) { mutableStateOf(episode) }
     
@@ -266,10 +307,10 @@ fun PlayerScreen(
     var selectedQualityOption by remember { mutableStateOf<ExoVideoQualityOption?>(null) }
     var showPlayerSettingsDialog by remember { mutableStateOf(false) }
 
-    // 재생 속도는 플레이어 화면 안에서 유지하고, 설정 메뉴에서 변경한다.
-    var playbackSpeed by rememberSaveable { mutableFloatStateOf(1.0f) }
+    // 재생 속도는 전역 플레이어 설정에 저장되어 플레이어/일반 설정 화면에서 함께 사용한다.
+    val playbackSpeed = vm.playerSettings.playbackSpeed
     val playbackSpeedOptions = remember {
-        listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+        listOf(0.1f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
     }
 
     val fontPickerLauncher = rememberLauncherForActivityResult(
@@ -1159,7 +1200,10 @@ fun PlayerScreen(
         subView.setApplyEmbeddedStyles(isVttStyleEnabled)
         subView.setApplyEmbeddedFontSizes(isVttStyleEnabled)
 
-        val calculatedSp = 18f * (subtitleSizePercent / 100f)
+        // PiP는 실제 표시 영역이 매우 작기 때문에 일반 재생과 동일한 고정 sp를
+        // 사용하면 VTT 자막이 화면을 덮을 정도로 커진다. PiP에서만 별도 축소한다.
+        val pipScale = if (isInPictureInPicture) 0.48f else 1f
+        val calculatedSp = 18f * (subtitleSizePercent / 100f) * pipScale
         subView.setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, calculatedSp)
         val positionFraction = subtitleBottomPaddingFraction.coerceIn(0.03f, 0.45f)
         subView.setBottomPaddingFraction(positionFraction)
@@ -1193,6 +1237,10 @@ fun PlayerScreen(
             if (isVttStyleEnabled) Typeface.DEFAULT_BOLD else (customTypeface ?: Typeface.DEFAULT_BOLD)
         )
         subView.setStyle(transparentStyle)
+    }
+
+    LaunchedEffect(isInPictureInPicture, playerViewRef, subtitlesUrl, subtitleSizePercent, subtitleBottomPaddingFraction) {
+        playerViewRef?.let { applySubtitleSettingsToView(it) }
     }
 
     Box(
@@ -1361,6 +1409,19 @@ fun PlayerScreen(
             }
         }
 
+        // PlayerView의 controller는 처음 표시될 때 내부 상태에 따라 계속 남아 있을 수 있다.
+        // 화면 진입 후 짧은 유예시간을 두고 명시적으로 숨겨 초기 UI가 터치 전까지
+        // 고정되는 문제를 방지한다. 이후 사용자가 터치하면 Media3 controller가 다시 표시한다.
+        LaunchedEffect(playerViewRef, streamUrl, isPlayerLocked, showPlayerSettingsDialog) {
+            val pv = playerViewRef ?: return@LaunchedEffect
+            if (isPlayerLocked || streamUrl == null || showPlayerSettingsDialog) return@LaunchedEffect
+            delay(2500L)
+            if (pv.isControllerFullyVisible) {
+                pv.hideController()
+            }
+            isControlsVisible = false
+        }
+
         // 잠금 상태에서는 PlayerView의 기본 컨트롤을 사용하지 않고,
         // 화면 터치 시 잠금 버튼만 2초 동안 보여준다.
         if (isPlayerLocked) {
@@ -1432,7 +1493,7 @@ fun PlayerScreen(
         }
 
         AnimatedVisibility(
-            visible = isControlsVisible && !isPlayerLocked,
+            visible = (isControlsVisible || showPlayerSettingsDialog) && !isPlayerLocked,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.TopCenter)
@@ -1440,149 +1501,90 @@ fun PlayerScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 16.dp, start = 16.dp, end = 16.dp),
+                    .padding(top = 12.dp, start = 12.dp, end = 8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.Top
             ) {
-                IconButton(
-                    onClick = {
-                        back()
-                    }
+                Surface(
+                    modifier = Modifier.size(44.dp),
+                    shape = CircleShape,
+                    color = Color.Black.copy(alpha = 0.42f)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.ArrowBack,
-                        contentDescription = "뒤로가기",
-                        tint = Color.White
-                    )
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    // Player settings are consolidated here in the top-right.
-                    IconButton(onClick = { showPlayerSettingsDialog = true }) {
+                    IconButton(onClick = back) {
                         Icon(
-                            imageVector = Icons.Default.Settings,
-                            contentDescription = "설정",
+                            imageVector = Icons.Default.ArrowBack,
+                            contentDescription = "뒤로가기",
                             tint = Color.White
                         )
                     }
-
-                    Spacer(modifier = Modifier.width(4.dp))
-
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color.Black.copy(alpha = 0.5f))
-                            .clickable { isAutoPlayEnabled = !isAutoPlayEnabled }
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
-                    ) {
-                        Text(
-                            text = "자동재생",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Switch(
-                            checked = isAutoPlayEnabled,
-                            onCheckedChange = { isAutoPlayEnabled = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = Lilac,
-                                uncheckedThumbColor = Color.Gray,
-                                uncheckedTrackColor = Color.DarkGray
-                            ),
-                            modifier = Modifier.scale(0.7f)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color.Black.copy(alpha = 0.5f))
-                            .clickable { isAutoSkipEnabled = !isAutoSkipEnabled }
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
-                    ) {
-                        Text(
-                            text = "OP/ED",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Switch(
-                            checked = isAutoSkipEnabled,
-                            onCheckedChange = { isAutoSkipEnabled = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = Lilac,
-                                uncheckedThumbColor = Color.Gray,
-                                uncheckedTrackColor = Color.DarkGray
-                            ),
-                            modifier = Modifier.scale(0.7f)
-                        )
-                    }
                 }
-            }
-        }
 
-        if (vm.playerSettings.showAniSkipButton) buttonAniSkipSegment?.let { segment ->
-            val label = if (segment.type == "op" || segment.type == "mixed-op") {
-                "OP 스킵"
-            } else {
-                "ED 스킵"
-            }
+                Spacer(Modifier.weight(1f))
 
-            Button(
-                onClick = {
-                    val positionSeconds = exoPlayer.currentPosition / 1000.0
-                    val duration = exoPlayer.duration
-                    val targetSeconds = if (duration > 0L && duration != C.TIME_UNSET) {
-                        minOf(segment.endTime, duration / 1000.0 - 0.5)
-                    } else {
-                        segment.endTime
-                    }
-
-                    Log.d(
-                        "AniSkip",
-                        "BUTTON_SKIP type=${segment.type} position=$positionSeconds target=$targetSeconds"
-                    )
-
-                    skippedAniSkipKeys = skippedAniSkipKeys + "${segment.type}:${segment.startTime}:${segment.endTime}"
-                    activeAniSkipSegment = null
-                    buttonAniSkipSegment = null
-                    aniSkipEnteredAtMs = -1L
-
-                    if (targetSeconds > positionSeconds) {
-                        exoPlayer.seekTo((targetSeconds * 1000.0).toLong().coerceAtLeast(0L))
-                    }
-                },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = 20.dp, bottom = 72.dp),
-                shape = RoundedCornerShape(24.dp)
-            ) {
-                Text(label)
-            }
-        }
-
-        if (showPlayerSettingsDialog) {
-            AlertDialog(
-                onDismissRequest = { showPlayerSettingsDialog = false },
-                title = { Text("플레이어 설정", fontWeight = FontWeight.Bold) },
-                text = {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .verticalScroll(rememberScrollState())
+                Box(
+                    modifier = Modifier.wrapContentWidth(Alignment.End)
+                ) {
+                    Surface(
+                        modifier = Modifier.size(44.dp),
+                        shape = CircleShape,
+                        color = Color.Black.copy(alpha = 0.42f)
                     ) {
+                        IconButton(onClick = { showPlayerSettingsDialog = !showPlayerSettingsDialog }) {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "플레이어 설정",
+                                tint = Color.White
+                            )
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = showPlayerSettingsDialog,
+                        onDismissRequest = { showPlayerSettingsDialog = false },
+                        modifier = Modifier
+                            .width(320.dp)
+                            .heightIn(max = 520.dp),
+                        shape = RoundedCornerShape(18.dp),
+                        containerColor = Color(0xFF18161D),
+                        tonalElevation = 6.dp,
+                        shadowElevation = 16.dp
+                    ) {
+                        CompositionLocalProvider(LocalContentColor provides Color.White) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 520.dp)
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                            ) {
+                                Text("재생 설정", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                Text("재생 · 스킵 · 자막 설정", fontSize = 11.sp, color = Color.LightGray)
+                                Spacer(Modifier.height(14.dp))
+                                HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+                                Spacer(Modifier.height(14.dp))
+
+                                SettingToggleRow(
+                                    icon = Icons.Default.PlayArrow,
+                                    title = "다음화 자동재생",
+                                    checked = isAutoPlayEnabled,
+                                    onCheckedChange = { isAutoPlayEnabled = it }
+                                )
+                                Spacer(Modifier.height(6.dp))
+                                SettingToggleRow(
+                                    icon = Icons.Default.FastForward,
+                                    title = "OP/ED 자동 스킵",
+                                    checked = isAutoSkipEnabled,
+                                    onCheckedChange = { isAutoSkipEnabled = it }
+                                )
+
+                                Spacer(Modifier.height(18.dp))
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("재생 속도", fontWeight = FontWeight.Bold, color = LilacDark)
+                            Text("재생 속도", fontWeight = FontWeight.Bold, color = Color.White)
                             Text(
                                 "${String.format(java.util.Locale.US, "%.2f", playbackSpeed)}x",
                                 fontWeight = FontWeight.Bold,
@@ -1592,18 +1594,18 @@ fun PlayerScreen(
 
                         Spacer(Modifier.height(8.dp))
 
+                        val speedIndex = playbackSpeedOptions.indexOf(playbackSpeed)
+                            .takeIf { it >= 0 } ?: 4
                         Slider(
-                            value = playbackSpeedOptions.indexOf(playbackSpeed)
-                                .takeIf { it >= 0 }
-                                ?.toFloat() ?: 2f,
+                            value = speedIndex.toFloat(),
                             onValueChange = { value ->
-                                val index = value.toInt().coerceIn(
-                                    0,
-                                    playbackSpeedOptions.lastIndex
+                                val index = value.roundToInt().coerceIn(playbackSpeedOptions.indices)
+                                vm.updatePlayerSettings(
+                                    context,
+                                    vm.playerSettings.copy(playbackSpeed = playbackSpeedOptions[index])
                                 )
-                                playbackSpeed = playbackSpeedOptions[index]
                             },
-                            valueRange = 0f..playbackSpeedOptions.lastIndex.toFloat(),
+                            valueRange = 0f..(playbackSpeedOptions.lastIndex).toFloat(),
                             steps = playbackSpeedOptions.size - 2,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -1612,9 +1614,14 @@ fun PlayerScreen(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text("0.5x", fontSize = 11.sp, color = Color.Gray)
-                            Text("1.0x", fontSize = 11.sp, color = Color.Gray)
-                            Text("2.0x", fontSize = 11.sp, color = Color.Gray)
+                            playbackSpeedOptions.forEach { speed ->
+                                Text(
+                                    "${speed}x",
+                                    fontSize = 9.sp,
+                                    color = if (speed == playbackSpeed) Lilac else Color.Gray,
+                                    fontWeight = if (speed == playbackSpeed) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
                         }
 
                         Text(
@@ -1628,7 +1635,7 @@ fun PlayerScreen(
                         HorizontalDivider()
                         Spacer(Modifier.height(16.dp))
 
-                        Text("M3U8 화질 직접 선택", fontWeight = FontWeight.Bold, color = LilacDark)
+                        Text("M3U8 화질 직접 선택", fontWeight = FontWeight.Bold, color = Color.White)
                         Spacer(Modifier.height(6.dp))
 
                         if (parsedStreamingQualities.isNotEmpty()) {
@@ -1703,7 +1710,7 @@ fun PlayerScreen(
                                 Text(
                                     "OP/ED 스킵 버튼 표시",
                                     fontWeight = FontWeight.Bold,
-                                    color = LilacDark
+                                    color = Color.White
                                 )
                                 Text(
                                     "재생화면에 나타나는 OP/ED 스킵 버튼을 표시합니다.",
@@ -1726,7 +1733,7 @@ fun PlayerScreen(
                         HorizontalDivider()
                         Spacer(Modifier.height(16.dp))
 
-                        Text("자막 소스", fontWeight = FontWeight.Bold, color = LilacDark)
+                        Text("자막 소스", fontWeight = FontWeight.Bold, color = Color.White)
                         Text(
                             "다운로드된 Linkkf VTT, Kairan ASS, Csora ASS 중 재생할 소스를 여기서 바로 선택합니다.",
                             fontSize = 11.sp,
@@ -1773,7 +1780,7 @@ fun PlayerScreen(
                         HorizontalDivider()
                         Spacer(Modifier.height(16.dp))
 
-                        Text("자막 설정", fontWeight = FontWeight.Bold, color = LilacDark)
+                        Text("자막 설정", fontWeight = FontWeight.Bold, color = Color.White)
                         Spacer(Modifier.height(10.dp))
 
                         val currentUserSubtitle = currentEpisode.vttUrl?.takeIf { isLocalUserSubtitlePath(it) }
@@ -1847,7 +1854,16 @@ fun PlayerScreen(
                                 modifier = Modifier.weight(1f),
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                suffix = { Text("ms") }
+                                suffix = { Text("ms", color = Color.White) },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White,
+                                    cursorColor = Color.White,
+                                    focusedBorderColor = Lilac,
+                                    unfocusedBorderColor = Color.White.copy(alpha = 0.45f),
+                                    focusedLabelColor = Lilac,
+                                    unfocusedLabelColor = Color.LightGray
+                                )
                             )
                             Spacer(Modifier.width(8.dp))
                             Text(
@@ -1902,7 +1918,14 @@ fun PlayerScreen(
                                 },
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier.width(65.dp),
-                                singleLine = true
+                                singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White,
+                                    cursorColor = Color.White,
+                                    focusedBorderColor = Lilac,
+                                    unfocusedBorderColor = Color.White.copy(alpha = 0.45f)
+                                )
                             )
                             Text("%", modifier = Modifier.padding(start = 4.dp), fontSize = 12.sp)
                         }
@@ -1932,64 +1955,86 @@ fun PlayerScreen(
                             }
                         }
                     }
-                },
-                confirmButton = {
-                    TextButton(onClick = { 
-                        vm.updatePlayerSettings(
-                            context,
-                            vm.playerSettings.copy(
-                                syncOffsetMs = syncOffsetText.toLongOrNull() ?: syncOffsetMs,
-                                subtitleSize = subtitleSizePercent,
-                                subtitleBottomPaddingFraction = subtitleBottomPaddingFraction,
-                                subtitleSourcePreference = subtitleSourcePreference
-                            )
-                        )
-                        showPlayerSettingsDialog = false 
-                    }) {
-                        Text("확인")
-                    }
                 }
-            )
+            }
         }
-        AnimatedVisibility(
-            visible = if (isPlayerLocked) showLockedButton else isControlsVisible,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 20.dp, bottom = 16.dp)
-                .size(48.dp)
-        ) {
-            IconButton(
+        }
+        }
+        if (vm.playerSettings.showAniSkipButton) buttonAniSkipSegment?.let { segment ->
+            val label = if (segment.type == "op" || segment.type == "mixed-op") {
+                "OP 스킵"
+            } else {
+                "ED 스킵"
+            }
+
+            Button(
                 onClick = {
-                    if (isPlayerLocked) {
-                        // 잠금 해제 후에는 일반 플레이어 컨트롤을 다시 사용할 수 있게 한다.
-                        isPlayerLocked = false
-                        showLockedButton = true
-                        isControlsVisible = true
+                    val positionSeconds = exoPlayer.currentPosition / 1000.0
+                    val duration = exoPlayer.duration
+                    val targetSeconds = if (duration > 0L && duration != C.TIME_UNSET) {
+                        minOf(segment.endTime, duration / 1000.0 - 0.5)
                     } else {
-                        // 잠금 상태에서는 잠금 버튼만 잠시 남긴다.
-                        isPlayerLocked = true
-                        showLockedButton = true
-                        lockedButtonRequest++
+                        segment.endTime
+                    }
+
+                    Log.d(
+                        "AniSkip",
+                        "BUTTON_SKIP type=${segment.type} position=$positionSeconds target=$targetSeconds"
+                    )
+
+                    skippedAniSkipKeys = skippedAniSkipKeys + "${segment.type}:${segment.startTime}:${segment.endTime}"
+                    activeAniSkipSegment = null
+                    buttonAniSkipSegment = null
+                    aniSkipEnteredAtMs = -1L
+
+                    if (targetSeconds > positionSeconds) {
+                        exoPlayer.seekTo((targetSeconds * 1000.0).toLong().coerceAtLeast(0L))
+                    }
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 20.dp, bottom = 72.dp),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Text(label)
+            }
+        }
+
+        if (isPlayerLocked || isControlsVisible) {
+            // 플레이어 전체 영역을 기준으로 우측 하단에 잠금 버튼을 고정한다.
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.BottomEnd
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .padding(end = 20.dp, bottom = 20.dp)
+                        .size(48.dp),
+                    shape = CircleShape,
+                    color = Color.Black.copy(alpha = 0.42f)
+                ) {
+                    IconButton(
+                        onClick = {
+                            if (isPlayerLocked) {
+                                isPlayerLocked = false
+                                showLockedButton = true
+                                isControlsVisible = true
+                            } else {
+                                isPlayerLocked = true
+                                showLockedButton = true
+                                lockedButtonRequest++
+                            }
+                        }
+                    ) {
+                        Icon(
+                            imageVector = if (isPlayerLocked) Icons.Default.Lock else Icons.Default.LockOpen,
+                            contentDescription = if (isPlayerLocked) "잠금 해제" else "플레이어 잠금",
+                            tint = Color.White
+                        )
                     }
                 }
-            ) {
-                Icon(
-                    imageVector = if (isPlayerLocked) Icons.Default.Lock else Icons.Default.LockOpen,
-                    contentDescription = if (isPlayerLocked) "잠금 해제" else "플레이어 잠금",
-                    tint = Color.White
-                )
             }
         }
     }
-}
-
-// ============================================================
-// KAIRAN03 BLOGGER + GOOGLE DRIVE SUBTITLE
-// ============================================================
-
-sealed class KairanSubtitleResult {
-    data class DirectFile(val path: String) : KairanSubtitleResult()
 }
 

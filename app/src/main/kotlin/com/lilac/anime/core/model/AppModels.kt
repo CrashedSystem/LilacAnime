@@ -26,7 +26,9 @@ data class PlayerSettings(
     val customFontPath: String? = null,
     val showAniSkipButton: Boolean = true,
     // 좌/우 더블 탭 시 이동할 시간(초)
-    val doubleTapSeekSeconds: Int = 10
+    val doubleTapSeekSeconds: Int = 10,
+    // 기본 재생 배속
+    val playbackSpeed: Float = 1.0f
 )
 
 data class ExoVideoQualityOption(

@@ -2,6 +2,7 @@ package com.lilac.anime
 
 import android.content.Context
 import android.util.Log
+import com.lilac.anime.data.subtitle.KairanSubtitleResult
 import com.lilac.anime.data.subtitle.KairanTitleNormalizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext

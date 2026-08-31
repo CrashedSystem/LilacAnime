@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import androidx.media3.exoplayer.offline.Download
 import coil3.compose.AsyncImage
 import com.lilac.anime.data.*
+import com.lilac.anime.data.subtitle.KairanSubtitleResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch

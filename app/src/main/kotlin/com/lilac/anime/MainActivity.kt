@@ -152,6 +152,12 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         var isVideoPlaying: Boolean = false
+        var isInPictureInPicture: Boolean by mutableStateOf(false)
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode)
+        isInPictureInPicture = isInPictureInPictureMode
     }
 
     override fun onUserLeaveHint() {

@@ -33,6 +33,7 @@ object OfflineStore {
             putString("pref_custom_font_path", settings.customFontPath)
             putBoolean("pref_show_ani_skip_button", settings.showAniSkipButton)
             putInt("pref_double_tap_seek_seconds", settings.doubleTapSeekSeconds)
+            putFloat("pref_playback_speed", settings.playbackSpeed)
             apply()
         }
     }
@@ -74,7 +75,11 @@ object OfflineStore {
                 ?.takeIf { it == "linkkf" || it == "kairan" || it == "csora" } ?: "linkkf",
             customFontPath = prefs.getString("pref_custom_font_path", null),
             showAniSkipButton = prefs.getBoolean("pref_show_ani_skip_button", true),
-            doubleTapSeekSeconds = prefs.getInt("pref_double_tap_seek_seconds", 10).coerceIn(1, 120)
+            doubleTapSeekSeconds = prefs.getInt("pref_double_tap_seek_seconds", 10).coerceIn(1, 120),
+            playbackSpeed = prefs.getFloat("pref_playback_speed", 1.0f).let { saved ->
+                val options = floatArrayOf(0.1f, 0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+                options.minByOrNull { kotlin.math.abs(it - saved) } ?: 1.0f
+            }
         )
     }
 
