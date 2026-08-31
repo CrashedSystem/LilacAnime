@@ -46,6 +46,9 @@ class AnimeRepository {
                             val pageAnime = LinkkfParser.parseAnimeList(document)
                             page to pageAnime
                         } catch (_: Exception) {
+                            // LinkkfClient already retries transient LTE/5G failures.
+                            // A final failure is kept as an empty page here so one
+                            // unavailable page does not crash the whole flow.
                             page to emptyList<Anime>()
                         }
                     }
